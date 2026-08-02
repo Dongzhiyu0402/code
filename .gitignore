@@ -35,3 +35,11 @@ htmlcov/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 内部工作文件
+.workbuddy/
+cleanup.log
+_webtest/
+demo_home/
+.venv_check/
+.qa_verify/

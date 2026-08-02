@@ -1,9 +1,0 @@
-Traceback (most recent call last):
-  File "<string>", line 1, in <module>
-    import sys; sys.path.insert(0,'src'); import cfgdrift; print('version=', cfgdrift.__version__); import cfgdrift._cfgdrift as c; print('c_version=', c.version()); import cfgdrift.daemon, cfgdrift.alert; print('daemon/alert import OK'); from cfgdrift.cli import cli; print('cli groups:', [c.name for c in cli.commands])
-                                                                                                                                                                                                                                                                                                   ^^^^^^
-AttributeError: 'str' object has no attribute 'name'
-version= 0.3.0
-c_version= 0.3.0-c
-daemon/alert import OK
-EXIT=1

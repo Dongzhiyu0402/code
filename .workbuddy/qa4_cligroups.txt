@@ -1,3 +1,0 @@
-cli commands: ['alert', 'baseline', 'daemon', 'diff', 'ignore', 'init', 'report', 'scan', 'serve']
-daemon sub: ['start', 'status', 'stop']
-alert sub: ['add', 'list', 'remove', 'test']
