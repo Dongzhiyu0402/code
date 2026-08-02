@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel>=0.40"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfgdrift"
+version = "0.3.0"
+description = "Semantic-level configuration drift detection system (JSON/TOML/INI parsed in C or pure Python, YAML via PyYAML)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "cfgdrift team" }]
+keywords = ["config", "drift", "detection", "semantic", "diff"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "click>=8.1",
+    "PyYAML>=6.0",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+cfgdrift = "cfgdrift.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cfgdrift = ["web/static/*.html", "web/static/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

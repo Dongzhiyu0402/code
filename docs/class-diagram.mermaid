@@ -1,0 +1,137 @@
+classDiagram
+    class Severity {
+        <<enum>>
+        +CRITICAL
+        +WARN
+        +INFO
+        +NONE
+    }
+    class ChangeType {
+        <<enum>>
+        +ADDED
+        +REMOVED
+        +MODIFIED
+        +TYPE_CHANGED
+    }
+    class DriftItem {
+        +str key_path
+        +ChangeType change_type
+        +Severity severity
+        +str file
+        +Any old_value
+        +Any new_value
+        +str old_type
+        +str new_type
+        +str rule_id
+        +to_dict() dict
+    }
+    class ScanSummary {
+        +int added
+        +int removed
+        +int modified
+        +int type_changed
+        +int ignored
+        +int total
+        +Severity max_severity
+        +to_dict() dict
+    }
+    class Report {
+        +int scan_id
+        +Baseline baseline
+        +str created_at
+        +str mode
+        +ScanSummary summary
+        +list~DriftItem~ items
+        +to_dict() dict
+        +to_json() str
+    }
+    class Baseline {
+        +int id
+        +str name
+        +int version
+        +str description
+        +str created_at
+        +str scan_root
+        +str format
+        +dict data
+        +to_dict() dict
+    }
+    class IgnoreRule {
+        +int id
+        +Optional~int~ baseline_id
+        +str name
+        +str key_pattern
+        +str match_type
+        +Optional~str~ file_pattern
+        +Optional~str~ change_type
+        +bool enabled
+        +matches(item: DriftItem) bool
+    }
+    class Store {
+        +__init__(db_path: str)
+        +init_schema() None
+        +create_baseline(name, description, scan_root, format, data) Baseline
+        +list_baselines() list~Baseline~
+        +get_baseline(name: str) Baseline
+        +show_baseline(name: str, version: Optional~int~) Baseline
+        +rollback_baseline(name: str) Baseline
+        +add_scan(baseline_id: Optional~int~, mode: str, report: dict) int
+        +list_scans(limit: int) list~dict~
+        +get_scan(scan_id: int) dict
+        +add_rule(rule: IgnoreRule) int
+        +list_rules(baseline_id: Optional~int~) list~IgnoreRule~
+        +delete_rule(rule_id: int) None
+    }
+    class Scanner {
+        +scan_path(path: str, fmt: str) dict
+        +scan_dir(root: str, fmt: str) dict
+        +watch(root: str, fmt: str, interval: int, on_scan: Callable) None
+    }
+    class SemanticDiffer {
+        +diff(old: dict, new: dict, file: str, rules: list~IgnoreRule~) tuple~list~DriftItem~, ScanSummary~
+        +_diff_node(old, new, path, file, items) None
+    }
+    class SeverityEngine {
+        +classify(change_type: ChangeType) Severity
+    }
+    class ParserDispatch {
+        +parse_file(path: str, fmt: str) dict
+        +parse_text(text: str, fmt: str) dict
+        +detect_format(path: str) str
+        +_normalize(data: Any) dict
+        +_read_text(path: str) str
+    }
+    class Reporter {
+        +render_terminal(report: Report, color: bool) str
+        +render_json(report: Report) str
+    }
+    class Cli {
+        +main() None
+    }
+    class WebApp {
+        +create_app(store: Store) FastAPI
+    }
+    class CExtension {
+        <<C module cfgdrift._cfgdrift>>
+        +parse_json(text: str) dict
+        +parse_toml(text: str) dict
+        +parse_ini(text: str) dict
+        +version() str
+    }
+
+    ParserDispatch ..> CExtension : calls
+    ParserDispatch ..> PyYAML : yaml.safe_load
+    SemanticDiffer ..> SeverityEngine : uses
+    SemanticDiffer ..> IgnoreRule : filters
+    Reporter ..> Report : renders
+    Cli --> Scanner : uses
+    Cli --> Store : uses
+    Cli --> Reporter : uses
+    Cli --> ParserDispatch : uses
+    Cli --> SemanticDiffer : uses
+    WebApp --> Store : uses
+    Store --> Baseline : persists
+    Store --> IgnoreRule : persists
+    Report --> Baseline : references
+    Report --> ScanSummary : contains
+    Report --> DriftItem : contains
