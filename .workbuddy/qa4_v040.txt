@@ -1,0 +1,129 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.12, pytest-9.1.1, pluggy-1.6.0 -- C:\Users\20713\.workbuddy\binaries\python\versions\3.13.12\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\20713\WorkBuddy\2026-08-02-22-02-27
+configfile: pyproject.toml
+plugins: anyio-4.14.2
+collecting ... collected 25 items
+
+tests/test_qa_v040.py::TestRegressionV020::test_version_strings PASSED   [  4%]
+tests/test_qa_v040.py::TestRegressionV020::test_semantic_diff_still_works PASSED [  8%]
+tests/test_qa_v040.py::TestRegressionV020::test_cli_diff_exit_code_1 PASSED [ 12%]
+tests/test_qa_v040.py::TestSecurityBoundaries::test_payload_has_no_credential_fields PASSED [ 16%]
+tests/test_qa_v040.py::TestSecurityBoundaries::test_alerts_yaml_never_stores_smtp_plaintext PASSED [ 20%]
+tests/test_qa_v040.py::TestSeverityThreshold::test_info_drift_does_not_trigger_warn_rule PASSED [ 24%]
+tests/test_qa_v040.py::TestSeverityThreshold::test_critical_drift_triggers_warn_rule PASSED [ 28%]
+tests/test_qa_v040.py::TestSeverityThreshold::test_none_threshold_triggers_everything PASSED [ 32%]
+tests/test_qa_v040.py::TestBaselineScope::test_rule_scoped_to_a_ignores_b PASSED [ 36%]
+tests/test_qa_v040.py::TestScriptChannel::test_cfgdrift_env_contract PASSED [ 40%]
+tests/test_qa_v040.py::TestScriptChannel::test_nonzero_exit_counts_as_failure_and_retries PASSED [ 44%]
+tests/test_qa_v040.py::TestEmailChannel::test_env_password_and_subject_template PASSED [ 48%]
+tests/test_qa_v040.py::TestEmailChannel::test_smtp_exception_records_failure FAILED [ 52%]
+tests/test_qa_v040.py::TestEmailChannel::test_missing_password_env_raises_channel_error PASSED [ 56%]
+tests/test_qa_v040.py::TestRetryAndDedupe::test_retry_sleeps_are_1s_then_5s PASSED [ 60%]
+tests/test_qa_v040.py::TestRetryAndDedupe::test_retry_all_fail_raises_last_error PASSED [ 64%]
+tests/test_qa_v040.py::TestRetryAndDedupe::test_same_rule_same_fingerprint_suppressed_in_cooldown PASSED [ 68%]
+tests/test_qa_v040.py::TestRetryAndDedupe::test_different_rule_names_each_trigger_once PASSED [ 72%]
+tests/test_qa_v040.py::TestDaemonLifecycle::test_status_stopped_then_pid_then_corrupt_then_stale PASSED [ 76%]
+tests/test_qa_v040.py::TestDaemonLifecycle::test_stop_idempotent_when_not_running PASSED [ 80%]
+tests/test_qa_v040.py::TestDaemonLifecycle::test_foreground_lifecycle_and_duplicate_start PASSED [ 84%]
+tests/test_qa_v040.py::TestDaemonLifecycle::test_windows_background_daemon_start_status_stop PASSED [ 88%]
+tests/test_qa_v040.py::TestAlertTestCLI::test_webhook_ok_exit_0 PASSED   [ 92%]
+tests/test_qa_v040.py::TestAlertTestCLI::test_unreachable_exit_2 PASSED  [ 96%]
+tests/test_qa_v040.py::TestEndToEndAlertChain::test_full_chain_payload_cooldown_retrigger FAILED [100%]
+
+================================== FAILURES ===================================
+____________ TestEmailChannel.test_smtp_exception_records_failure _____________
+
+self = <test_qa_v040.TestEmailChannel object at 0x00000286365E1E50>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000028636647E10>
+cfg_home = 'C:\\Users\\20713\\AppData\\Local\\Temp\\pytest-of-20713\\pytest-46\\test_smtp_exception_records_fa0\\home'
+
+    def test_smtp_exception_records_failure(self, monkeypatch, cfg_home):
+        def boom(*args, **kwargs):
+            raise smtplib.SMTPException("connection refused")
+    
+        monkeypatch.setattr(smtplib, "SMTP", boom)
+        monkeypatch.setenv("CFGDRIFT_SMTP_PASSWORD", "pw")
+        rule = AlertRule(
+            name="mail", type="email",
+            config={
+                "smtp_host": "smtp.example.com", "smtp_port": 587,
+                "smtp_from": "a@b.c", "smtp_to": ["ops@b.c"],
+                "smtp_password_env": "CFGDRIFT_SMTP_PASSWORD",
+            },
+        )
+        disp = make_dispatcher([rule], os.path.join(cfg_home, "s.json"), cfg_home)
+        results = disp.dispatch_report(
+            "prod", "/etc/app", make_report([make_item()], max_sev="WARN")
+        )
+        assert len(results) == 1 and results[0].sent is False
+>       assert "SMTPException" in (results[0].error or "")
+E       AssertionError: assert 'SMTPException' in (('email send failed: connection refused'))
+E        +  where 'email send failed: connection refused' = DispatchResult(rule=AlertRule(name='mail', type='email', severity=<Severity.WARN: 'WARN'>, baseline=None, enabled=True, config={'smtp_host': 'smtp.example.com', 'smtp_port': 587, 'smtp_from': 'a@b.c', 'smtp_to': ['ops@b.c'], 'smtp_password_env': 'CFGDRIFT_SMTP_PASSWORD'}), fingerprint='520398c9d475a61ab44ddec45c5b3ac2076aab42e76aed157adbd40dda35fcc6', key='d21d662f0856c2f71932ec22d33ac791bd0a5a64e629b331886039e11690da04', attempted=True, sent=False, attempts=1, error='email send failed: connection refused').error
+
+tests\test_qa_v040.py:540: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    cfgdrift.alert.dispatcher:dispatcher.py:143 alert mail failed after 1 attempt(s): email send failed: connection refused
+______ TestEndToEndAlertChain.test_full_chain_payload_cooldown_retrigger ______
+
+self = <test_qa_v040.TestEndToEndAlertChain object at 0x00000286365E2710>
+cfg_home = 'C:\\Users\\20713\\AppData\\Local\\Temp\\pytest-of-20713\\pytest-46\\test_full_chain_payload_cooldo0\\home'
+project = 'C:\\Users\\20713\\AppData\\Local\\Temp\\pytest-of-20713\\pytest-46\\test_full_chain_payload_cooldo0\\conf'
+webhook_server = (<http.server.HTTPServer object at 0x0000028636892E00>, <test_qa_v040._Collector object at 0x00000286368928B0>)
+
+    def test_full_chain_payload_cooldown_retrigger(self, cfg_home, project,
+                                                   webhook_server):
+        server, collector = webhook_server
+        env = {"CFGDRIFT_HOME": cfg_home}
+    
+        # init + baseline
+        p = run_cli(["init"], env=env)
+        assert p.returncode == 0, p.stdout + p.stderr
+        p = run_cli(["scan", project, "--save-as-baseline", "prod"], env=env)
+        assert p.returncode == 0, p.stdout + p.stderr
+    
+        # add webhook alert
+        url = "http://127.0.0.1:%d/hook" % server.server_port
+        p = run_cli(
+            ["alert", "add", "--name", "hook", "--type", "webhook", "--url", url],
+            env=env,
+        )
+        assert p.returncode == 0, p.stdout + p.stderr
+    
+        # create drift: port 8080 -> 9090 (modified, WARN)
+        with open(os.path.join(project, "app.json"), "w", encoding="utf-8") as fh:
+            json.dump({"server": {"host": "localhost", "port": 9090},
+                       "debug": False}, fh)
+    
+        # start daemon foreground
+        proc = _start_foreground(project, cfg_home)
+        try:
+            payload = collector.wait_payload(timeout=20)
+            assert payload is not None, "no webhook payload received"
+    
+            # -- payload field correctness (independent assertions) --
+            assert payload["event"] == "cfgdrift.drift"
+            assert payload["version"] == "0.3.0"
+            assert payload["baseline"] == "prod"
+            assert payload["target"] == os.path.abspath(project)
+            assert payload["drift_count"] >= 1
+            assert payload["severity"] == "WARN"  # modified -> WARN
+            assert payload["summary"] == (
+                "%d WARN drift(s) in baseline prod" % payload["drift_count"]
+            )
+            by_key = {item["key"]: item for item in payload["drift_items"]}
+            assert "server.port" in by_key
+            port_item = by_key["server.port"]
+            assert port_item["file"] == "app.json"
+            assert port_item["change_type"] == "modified"
+            assert port_item["severity"] == "WARN"
+>           assert port_item["baseline"] == "8080"
+E           AssertionError: assert 8080 == '8080'
+
+tests\test_qa_v040.py:851: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_qa_v040.py::TestEmailChannel::test_smtp_exception_records_failure
+FAILED tests/test_qa_v040.py::TestEndToEndAlertChain::test_full_chain_payload_cooldown_retrigger
+======================== 2 failed, 23 passed in 23.39s ========================
+EXIT=1

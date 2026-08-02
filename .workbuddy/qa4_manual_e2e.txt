@@ -1,0 +1,42 @@
+PAYLOAD:
+{
+  "event": "cfgdrift.drift",
+  "version": "0.3.0",
+  "timestamp": "2026-08-02T16:46:13.583807+00:00",
+  "severity": "WARN",
+  "baseline": "prod",
+  "target": "C:\\Users\\20713\\AppData\\Local\\Temp\\cfgdrift-e2e-vla3ab5p\\conf",
+  "drift_count": 2,
+  "drift_items": [
+    {
+      "key": "debug",
+      "baseline": false,
+      "current": true,
+      "severity": "WARN",
+      "file": "app.json",
+      "change_type": "modified"
+    },
+    {
+      "key": "server.port",
+      "baseline": 8080,
+      "current": 9090,
+      "severity": "WARN",
+      "file": "app.json",
+      "change_type": "modified"
+    }
+  ],
+  "summary": "2 WARN drift(s) in baseline prod"
+}
+STATUS AFTER STOP: exit=1 out='daemon not running'
+
+E2E OK: payload received, cooldown respected, log written, graceful stop
+LOG TAIL:
+2026-08-02T16:46:14Z INFO [cfgdrift.daemon] scan cycle done scan_id=3 target=C:\Users\20713\AppData\Local\Temp\cfgdrift-e2e-vla3ab5p\conf total=2 max=WARN
+2026-08-02T16:46:14Z INFO [cfgdrift.alert.dispatcher] alert hook suppressed (cooldown) key=1ac4f1ec27d8
+2026-08-02T16:46:15Z INFO [cfgdrift.daemon] scan cycle start (baseline=prod interval=1s)
+2026-08-02T16:46:15Z INFO [cfgdrift.daemon] scan cycle done scan_id=4 target=C:\Users\20713\AppData\Local\Temp\cfgdrift-e2e-vla3ab5p\conf total=2 max=WARN
+2026-08-02T16:46:15Z INFO [cfgdrift.alert.dispatcher] alert hook suppressed (cooldown) key=1ac4f1ec27d8
+2026-08-02T16:46:16Z INFO [cfgdrift.daemon] scan cycle start (baseline=prod interval=1s)
+2026-08-02T16:46:16Z INFO [cfgdrift.daemon] scan cycle done scan_id=5 target=C:\Users\20713\AppData\Local\Temp\cfgdrift-e2e-vla3ab5p\conf total=2 max=WARN
+2026-08-02T16:46:16Z INFO [cfgdrift.alert.dispatcher] alert hook suppressed (cooldown) key=1ac4f1ec27d8
+EXIT=0

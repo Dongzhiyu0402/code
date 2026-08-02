@@ -1,0 +1,54 @@
+name: ci
+
+# v0.2.0 CI matrix: Python 3.8 / 3.10 / 3.11 / 3.13 x {C, pure}.
+# 受限环境可只提交本配置不实跑（默认 workflow_dispatch 触发）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: py${{ matrix.python }} / ${{ matrix.mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.10", "3.11", "3.13"]
+        mode: ["c", "pure"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip setuptools wheel build
+
+      - name: Install package (C mode)
+        if: matrix.mode == 'c'
+        run: python -m pip install -e ".[dev]"
+
+      - name: Install package (pure mode, no C)
+        if: matrix.mode == 'pure'
+        run: |
+          CFGDRIFT_NO_C=1 python -m pip install -e ".[dev]"
+          python -c "import cfgdrift._cfgdrift" && exit 1 || echo "OK: _cfgdrift absent"
+
+      - name: Run tests (C mode)
+        if: matrix.mode == 'c'
+        run: python -m pytest tests/ -q
+
+      - name: Run tests (pure mode)
+        if: matrix.mode == 'pure'
+        run: CFGDRIFT_BACKEND=pure python -m pytest tests/ -q
+
+      - name: Build wheels (pure mode sanity)
+        if: matrix.mode == 'pure'
+        run: |
+          CFGDRIFT_NO_C=1 python -m build --wheel --outdir dist-pure
+          ls -1 dist-pure
