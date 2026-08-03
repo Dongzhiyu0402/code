@@ -229,6 +229,9 @@ def _make_ini_parser() -> configparser.ConfigParser:
     - ``default_section`` sentinel: see module constant docstring.
     - ``allow_unnamed_section=True`` (Python 3.13+ only): the refactored
       configparser otherwise rejects options before the first section header.
+      On Python < 3.13 (no ``allow_unnamed_section`` support) the caller
+      (:func:`parse_ini_pure`) re-reads top-level-option texts wrapped in the
+      sentinel default section instead.
     """
     kwargs = dict(
         strict=False,
@@ -299,10 +302,27 @@ def parse_ini_pure(text: str) -> Any:
     so it is wrapped into the shared ``ValueError`` prefix; the line number is
     taken from ``ParsingError.errors[0][0]`` when available, else the
     exception's own ``lineno``, else 1.
+
+    Top-level options (key-value pairs before the first ``[section]`` header)
+    are accepted and exposed as top-level keys, mirroring the C backend.  On
+    Python 3.13+ that is what ``allow_unnamed_section=True`` does; on older
+    versions ``configparser`` raises ``MissingSectionHeaderError`` instead, so
+    the whole text is re-read wrapped in the sentinel default section (whose
+    options :func:`_ini_collect` lifts to the top level).  The synthetic
+    header shifts every configparser line number by one, which is subtracted
+    from reported error lines so positions stay relative to the original text.
     """
     cp = _make_ini_parser()
+    offset = 0
     try:
-        cp.read_string(text)
+        try:
+            cp.read_string(text)
+        except configparser.MissingSectionHeaderError:
+            # Python < 3.13: no allow_unnamed_section support.  Wrap the text
+            # so the top-level options land in the sentinel default section.
+            offset = 1
+            cp = _make_ini_parser()
+            cp.read_string("[%s]\n%s" % (_CFGDRIFT_DEFAULT_SECTION, text))
     except configparser.Error as exc:
         line = 1
         lineno = getattr(exc, "lineno", None)
@@ -310,5 +330,6 @@ def parse_ini_pure(text: str) -> Any:
             line = lineno
         elif isinstance(exc, configparser.ParsingError) and exc.errors:
             line = exc.errors[0][0]
+        line = max(1, line - offset)
         raise _parse_error(line, 1, str(exc)) from exc
     return _ini_collect(cp)

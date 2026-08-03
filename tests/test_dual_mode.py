@@ -407,6 +407,77 @@ def test_gbk_file_dual_mode(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Regression: top-level INI options (no section header) in pure mode
+# ---------------------------------------------------------------------------
+#
+# The C backend always accepted key-value pairs before the first ``[section]``
+# header and exposed them as top-level keys.  The pure backend used
+# ``configparser`` which only gained ``allow_unnamed_section=True`` in Python
+# 3.13; on 3.8-3.12 the same input raised ``MissingSectionHeaderError``,
+# breaking CI (e.g. test_ini_quote_stripping_both_backends on ubuntu).  The
+# parser now re-reads such texts wrapped in the sentinel default section, so
+# this must pass on every supported Python version.
+
+
+_INI_TOP_LEVEL_CASES = [
+    # (text, expected_tree)
+    # The exact v0.2.0 QA regression: quote stripping at top level.
+    (
+        'a = "  trimmed  "\nb = \'world\'\nempty = ""\n',
+        {"a": "  trimmed  ", "b": "world", "empty": ""},
+    ),
+    ("a = 1\nb = 2\n", {"a": "1", "b": "2"}),
+    ("a: 1\n", {"a": "1"}),  # colon delimiter
+    ("a = 1\na = 2\n", {"a": "2"}),  # duplicate key -> last-wins
+    ('empty = ""\n', {"empty": ""}),  # empty quoted value
+    ("url = http://x?a=b\n", {"url": "http://x?a=b"}),  # '=' inside value
+    ("# c1\n; c2\na = 1\n", {"a": "1"}),  # full-line comments
+    ("Key = 1\n", {"Key": "1"}),  # key case preserved
+    # Top-level options followed by a real section header.
+    ("a = 1\n[s]\nb = 2\n", {"a": "1", "s": {"b": "2"}}),
+]
+
+
+def test_ini_top_level_options_pure_regression():
+    """Pure backend parses top-level INI options on every Python version.
+
+    Before the fix this raised ``MissingSectionHeaderError`` (wrapped as
+    ``ValueError``) on Python 3.8-3.12 while the C backend succeeded, so the
+    dual-mode corpus diverged.  Assert the exact trees so a future
+    configparser behavior change is caught.
+    """
+    for text, expected in _INI_TOP_LEVEL_CASES:
+        got = pure_parsers.parse_ini_pure(text)
+        assert _tree_equal(got, expected), (text, got, expected)
+
+
+@requires_c
+def test_ini_top_level_options_c_pure_equivalent():
+    """C and pure backends agree on top-level INI options (dual-mode)."""
+    for text, expected in _INI_TOP_LEVEL_CASES:
+        c_tree = _C_PARSERS["ini"](text)
+        pure_tree = _PURE_PARSERS["ini"](text)
+        assert _tree_equal(c_tree, expected), (text, c_tree, expected)
+        assert _tree_equal(pure_tree, expected), (text, pure_tree, expected)
+        assert _tree_equal(c_tree, pure_tree), (text, c_tree, pure_tree)
+
+
+def test_ini_top_level_options_dispatch_both_backends():
+    """The dispatch layer (set_backend) parses top-level INI in both modes."""
+    text = 'a = "  trimmed  "\nb = \'world\'\nempty = ""\n'
+    expected = {"a": "  trimmed  ", "b": "world", "empty": ""}
+    original = parser_mod.PARSER_BACKEND
+    try:
+        parser_mod.set_backend("pure")
+        assert parser_mod.parse_text(text, "ini") == expected
+        if HAVE_C:
+            parser_mod.set_backend("c")
+            assert parser_mod.parse_text(text, "ini") == expected
+    finally:
+        parser_mod.set_backend(original)
+
+
+# ---------------------------------------------------------------------------
 # End-to-end: pure backend CLI pipeline (scan -> baseline -> diff)
 # ---------------------------------------------------------------------------
 
