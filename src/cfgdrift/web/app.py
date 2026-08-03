@@ -9,7 +9,12 @@ v0.4.0 additions: ``/api/alerts`` (alert rules from alerts.yaml),
 roots), masked report responses, and daemon status in the overview.
 """
 
-from __future__ import annotations
+# NOTE: this module deliberately does **not** use ``from __future__ import
+# annotations``: the route handlers annotate ``request: Request`` with the
+# FastAPI ``Request`` class imported *inside* ``create_app`` (so that
+# ``import cfgdrift.web`` never requires the ``[web]`` extra).  With PEP 563
+# lazy annotations those would become the string ``'Request'`` which FastAPI
+# cannot resolve against the closure scope, breaking body parsing (422).
 
 import os
 from typing import Any, Dict, Optional
@@ -128,6 +133,95 @@ def create_app(store, home: Optional[str] = None):
         # keeps raw values.
         masker.mask_payload(payload)
         return payload
+
+    @app.get("/api/reports/{scan_id}/html")
+    def api_report_html(scan_id: int):
+        """Standalone offline HTML report (v0.5.0) — same renderer as the CLI.
+
+        Data flow (D6): ``store.get_scan`` -> ``mask_payload`` ->
+        ``HtmlReporter.render_html``, so the Web export and
+        ``cfgdrift report --html`` are structurally identical.
+        """
+        from fastapi.responses import Response
+
+        try:
+            payload = store.get_scan(scan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if payload.get("code") != 0:
+            return err(payload.get("message", "scan report is invalid"))
+        masker.mask_payload(payload)
+        from ..core.htmlreport import HtmlReporter
+
+        html = HtmlReporter.render_html(
+            payload["data"], title="cfgdrift report #%s" % scan_id
+        )
+        return Response(content=html, media_type="text/html; charset=utf-8")
+
+    @app.post("/api/compare")
+    async def api_compare(request: Request):
+        """Compare two environments' baselines (v0.5.0).
+
+        Contract: ``{"env1": ..., "env2": ...}`` -> 200 with the masked
+        :class:`CompareReport` (plus per-item ``snippet_root``); 400 for
+        missing/identical environments; 404 for an uncollected baseline.
+        """
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON body
+            return err("invalid JSON body")
+        env1 = str(body.get("env1", "")).strip()
+        env2 = str(body.get("env2", "")).strip()
+        if not env1 or not env2:
+            return err("env1 and env2 are required")
+        if env1 == env2:
+            return err("env1 and env2 must be different")
+
+        from ..core.compare import CompareEngine
+        from ..rules.severity import SeverityConfig
+        from ..rules.severity import default_path as severity_config_path
+
+        engine = CompareEngine(store)
+        env_map = engine.load_environments(home)
+        baseline1 = engine.resolve_baseline_name(env1, env_map)
+        baseline2 = engine.resolve_baseline_name(env2, env_map)
+
+        # Baselines must exist; otherwise a readable 404 (D7).
+        scan_roots: Dict[str, str] = {}
+        for env, baseline_name in ((env1, baseline1), (env2, baseline2)):
+            try:
+                bl = store.get_baseline(baseline_name)
+                scan_roots[baseline_name] = bl.scan_root
+            except ValueError as exc:
+                return err(
+                    "环境 %s 未采集基线（%s）" % (env, exc),
+                    status=404,
+                )
+
+        severity_rules = []
+        sev_path = severity_config_path(home)
+        if os.path.exists(sev_path):
+            severity_rules = SeverityConfig.load(sev_path)
+
+        try:
+            reports = engine.compare(
+                [env1, env2],
+                env_map=env_map,
+                severity_rules=severity_rules,
+                masker=masker,
+            )
+        except ValueError as exc:
+            return err(str(exc), status=404)
+
+        data = reports[0].to_dict()
+        # Inject the snippet root per item based on the line source side
+        # (removed -> env1 baseline root, everything else -> env2 root).
+        for item in data.get("items", []):
+            if item.get("change_type") == "removed":
+                item["snippet_root"] = scan_roots.get(baseline1, "")
+            else:
+                item["snippet_root"] = scan_roots.get(baseline2, "")
+        return ok(data)
 
     @app.get("/api/baselines")
     def api_baselines():

@@ -201,11 +201,37 @@ async function renderReports() {
     '<label>扫描：<select id="reportScan">' + options + "</select></label>" +
     '<label>严重度：<select id="reportSev"><option value="">全部</option><option>CRITICAL</option><option>WARN</option><option>INFO</option><option>NONE</option></select></label>' +
     '<button class="action" id="reportLoad">加载</button>' +
+    '<button class="action" id="reportExport">导出 HTML</button>' +
     "</div>" +
     '<div class="card" id="reportBody"></div>';
   if (scans.length) {
     $("#reportLoad").addEventListener("click", loadReport);
+    $("#reportExport").addEventListener("click", exportReportHtml);
     loadReport();
+  }
+}
+
+async function exportReportHtml() {
+  // v0.5.0: fetch the standalone HTML report and download it as a Blob.
+  const scanId = $("#reportScan").value;
+  try {
+    const res = await fetch("/api/reports/" + scanId + "/html");
+    if (!res.ok) {
+      const payload = await res.json().catch(() => null);
+      throw new Error((payload && payload.message) || ("HTTP " + res.status));
+    }
+    const text = await res.text();
+    const blob = new Blob([text], { type: "text/html;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "report-" + scanId + ".html";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert("导出失败：" + e.message);
   }
 }
 
@@ -288,6 +314,89 @@ async function renderRules() {
       renderRules();
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Compare view (v0.5.0)
+// ---------------------------------------------------------------------------
+
+async function renderCompare() {
+  // D7: environment options come from /api/baselines (baseline names are the
+  // only guaranteed-resolvable environment names).
+  const data = await api("/api/baselines");
+  const baselines = data.baselines || [];
+  const options = baselines.map((b) =>
+    '<option value="' + esc(b.name) + '">' + esc(b.name) + " v" + b.version + "</option>"
+  ).join("");
+  $("#view-compare").innerHTML =
+    "<h2>环境对比</h2>" +
+    '<div class="card form-row">' +
+    '<label>参考环境：<select id="cmpEnv1">' + options + "</select></label>" +
+    '<label>对比环境：<select id="cmpEnv2">' + options + "</select></label>" +
+    '<label>严重度：<select id="cmpSev"><option value="">全部</option><option>CRITICAL</option><option>WARN</option><option>INFO</option><option>NONE</option></select></label>' +
+    '<button class="action" id="cmpRun">对比</button>' +
+    "</div>" +
+    '<div class="card" id="cmpBody"><p class="muted">选择两个环境后点击「对比」。</p></div>';
+  if (baselines.length >= 2) {
+    const sel2 = $("#cmpEnv2");
+    sel2.selectedIndex = 1;
+  }
+  $("#cmpRun").addEventListener("click", runCompare);
+  if (baselines.length >= 2) runCompare();
+}
+
+async function runCompare() {
+  const env1 = $("#cmpEnv1").value;
+  const env2 = $("#cmpEnv2").value;
+  const sev = $("#cmpSev").value;
+  const body = $("#cmpBody");
+  body.innerHTML = '<p class="muted">对比中…</p>';
+  try {
+    const data = await api("/api/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ env1, env2 }),
+    });
+    renderCompareResult(data, sev);
+  } catch (e) {
+    body.innerHTML = '<p style="color:var(--critical)">对比失败：' + esc(e.message) + "</p>";
+  }
+}
+
+function renderCompareResult(data, sev) {
+  let items = (data.items || []).slice();
+  if (sev) items = items.filter((it) => it.severity === sev);
+  const s = data.summary || {};
+  const dist = { CRITICAL: 0, WARN: 0, INFO: 0, NONE: 0 };
+  (data.items || []).forEach((it) => {
+    const k = it.severity || "NONE";
+    dist[k] = (dist[k] || 0) + 1;
+  });
+  const peak = Math.max(1, ...Object.values(dist));
+  const bars = ["CRITICAL", "WARN", "INFO", "NONE"].map((k) => {
+    const n = dist[k] || 0;
+    const color = { CRITICAL: "var(--critical)", WARN: "var(--warn)", INFO: "var(--info)", NONE: "var(--none)" }[k];
+    return (
+      '<div class="bar-row">' +
+      '<div class="bar-label">' + k + "</div>" +
+      '<div class="bar-track"><div class="bar-fill" style="width:' + (n / peak * 100) + "%;background:" + color + '"></div></div>' +
+      '<div class="bar-num">' + n + "</div>" +
+      "</div>"
+    );
+  }).join("");
+  $("#cmpBody").innerHTML =
+    '<p class="muted">' + esc(data.baseline_a) + " (v" + (data.env1_version == null ? "?" : data.env1_version) +
+    ") → " + esc(data.baseline_b) + " (v" + (data.env2_version == null ? "?" : data.env2_version) + ")</p>" +
+    '<div class="stat-row">' +
+    stat("漂移总数", s.total || 0, "warn") +
+    stat("新增", s.added || 0, "info") +
+    stat("删除", s.removed || 0, "critical") +
+    stat("修改", s.modified || 0, "warn") +
+    stat("类型变化", s.type_changed || 0, "critical") +
+    "</div>" +
+    '<div class="card">' + bars + "</div>" +
+    '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th></tr></thead>' +
+    "<tbody>" + itemRows(items) + "</tbody></table>";
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +504,7 @@ const VIEWS = {
   timeline: renderTimeline,
   severity: renderSeverity,
   reports: renderReports,
+  compare: renderCompare,
   baselines: renderBaselines,
   rules: renderRules,
   alerts: renderAlerts,

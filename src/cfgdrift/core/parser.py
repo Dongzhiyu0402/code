@@ -42,6 +42,8 @@ except ImportError:  # pragma: no cover
     _HAVE_YAML = False
 
 from . import pure_parsers  # noqa: E402  (pure-Python fallback backend)
+from .lines import build_line_map as _lines_build_line_map  # noqa: E402
+from . import plugins as _plugins_mod  # noqa: E402  (parser plugin registry)
 
 logger = logging.getLogger("cfgdrift.core.parser")
 
@@ -131,25 +133,57 @@ _FORMAT_EXTENSIONS = {
     "ini": (".ini", ".cfg", ".conf"),
 }
 
+#: Plugin registry shared by detect_format / validate_format / parse_text.
+#: The four built-in formats are registered as built-in plugins at import
+#: time (bottom of this module); external plugins are discovered from the
+#: ``cfgdrift.parsers`` entry point group afterwards.
+_PLUGIN_REGISTRY = _plugins_mod.default_registry
+
 
 def detect_format(path: str) -> Optional[str]:
     """Detect the config format from a file extension.
 
-    Returns ``"json"`` / ``"yaml"`` / ``"toml"`` / ``"ini"`` or ``None`` if
-    the extension is unknown.
+    Built-in extensions are checked first (``.json`` / ``.yaml`` / ``.yml`` /
+    ``.toml`` / ``.ini`` / ``.cfg`` / ``.conf``); unknown extensions fall
+    back to registered parser plugins (v0.5.0).  Returns ``None`` when no
+    format/plugin owns the extension.
     """
     _, ext = os.path.splitext(path)
-    return _EXTENSION_FORMATS.get(ext.lower())
+    ext = ext.lower()
+    builtin = _EXTENSION_FORMATS.get(ext)
+    if builtin is not None:
+        return builtin
+    return _PLUGIN_REGISTRY.by_extension(ext)
 
 
 def validate_format(fmt: str) -> str:
-    """Validate a ``--format`` value; returns the normalized value."""
+    """Validate a ``--format`` value; returns the normalized value.
+
+    Legal values are ``auto`` / ``json`` / ``yaml`` / ``toml`` / ``ini``
+    plus every registered custom plugin name.  With no custom plugins the
+    error message is byte-for-byte identical to v0.4.0 (the plugin names are
+    only appended when custom plugins exist); unregistered names additionally
+    receive the registration guidance (v0.5.0).
+    """
+    if fmt in _VALID_FORMATS:
+        return fmt
+    if _PLUGIN_REGISTRY.get(fmt) is not None:
+        return fmt
+    custom = _PLUGIN_REGISTRY.custom_names()
+    expected = list(_VALID_FORMATS)
+    if custom:
+        expected = expected + custom
+    message = "invalid format %r (expected one of: %s)" % (
+        fmt,
+        ", ".join(expected),
+    )
     if fmt not in _VALID_FORMATS:
-        raise ValueError(
-            "invalid format %r (expected one of: %s)"
-            % (fmt, ", ".join(_VALID_FORMATS))
+        message += (
+            "\nregister a parser plugin via the 'cfgdrift.parsers' entry point group"
+            "\n(pyproject: [project.entry-points.\"cfgdrift.parsers\"] mydsl = \"pkg:plugin\")"
+            "\nor in-process via cfgdrift.core.plugins.register_plugin, then retry."
         )
-    return fmt
+    raise ValueError(message)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +278,12 @@ def _parse_yaml(text: str) -> Any:
 
 
 def parse_text(text: str, fmt: str) -> dict:
-    """Parse text of a given format into a normalized semantic tree (dict)."""
+    """Parse text of a given format into a normalized semantic tree (dict).
+
+    Built-in formats behave exactly as in v0.4.0.  A custom plugin format is
+    dispatched to ``plugin.parse`` and then normalized through the same
+    ``_normalize`` / ``_wrap_top_level`` path as the built-ins.
+    """
     fmt = validate_format(fmt)
     if fmt == "auto":
         raise ValueError("parse_text requires an explicit format (not 'auto')")
@@ -256,8 +295,11 @@ def parse_text(text: str, fmt: str) -> dict:
         data = _parse_toml(text)
     elif fmt == "ini":
         data = _parse_ini(text)
-    else:  # pragma: no cover - guarded by validate_format
-        raise ValueError("unsupported format %r" % fmt)
+    else:
+        plugin = _PLUGIN_REGISTRY.get(fmt)
+        if plugin is None:  # pragma: no cover - guarded by validate_format
+            raise ValueError("unsupported format %r" % fmt)
+        data = plugin.parse(text)
     if data is None:
         data = {}
     return _wrap_top_level(_normalize(data))
@@ -266,14 +308,23 @@ def parse_text(text: str, fmt: str) -> dict:
 def parse_text_lines(text: str, fmt: str) -> Tuple[dict, dict]:
     """Parse text and build ``{key_path: line}`` for the same text.
 
-    Returns ``(tree, line_map)``.  The line map is produced by a lightweight
-    text scan (:mod:`cfgdrift.core.lines`) that is independent of the parsing
-    backend, so C and pure modes are consistent by construction.
+    Returns ``(tree, line_map)``.  For built-in formats the line map is
+    produced by the lightweight text scan (:mod:`cfgdrift.core.lines`) that is
+    independent of the parsing backend.  For custom plugin formats the
+    plugin's optional ``build_line_map`` is used (``{}`` when not provided,
+    D10).
     """
-    from .lines import build_line_map
-
-    tree = parse_text(text, fmt)
-    line_map = build_line_map(text, fmt)
+    fmt = validate_format(fmt)
+    if fmt in ("json", "yaml", "toml", "ini"):
+        tree = parse_text(text, fmt)
+        line_map = _lines_build_line_map(text, fmt)
+        return tree, line_map
+    plugin = _PLUGIN_REGISTRY.get(fmt)
+    if plugin is None:  # pragma: no cover - guarded by validate_format
+        raise ValueError("unsupported format %r" % fmt)
+    raw = plugin.parse(text)
+    tree = _wrap_top_level(_normalize(raw))
+    line_map = plugin.build_line_map(text)
     return tree, line_map
 
 
@@ -324,3 +375,55 @@ def parse_file_lines(
             file=sys.stderr,
         )
     return parse_text_lines(text, fmt)
+
+
+# ---------------------------------------------------------------------------
+# Built-in plugins + external discovery (v0.5.0)
+# ---------------------------------------------------------------------------
+
+def _register_builtin_plugins() -> None:
+    """Register the four built-in formats as built-in plugins.
+
+    The built-in branches in :func:`parse_text` remain the primary dispatch
+    path; registering them as plugins makes ``custom_names()`` accurate and
+    lets ``detect_format`` reuse one registry for custom extensions.  Parse
+    and line-map behavior is identical to v0.4.0 by construction (the same
+    backend functions / ``lines.build_line_map`` are reused).
+    """
+
+    def _make_parse(fmt: str):
+        def parse(text: str) -> Any:
+            if fmt == "json":
+                return _parse_json(text)
+            if fmt == "yaml":
+                return _parse_yaml(text)
+            if fmt == "toml":
+                return _parse_toml(text)
+            return _parse_ini(text)
+
+        return parse
+
+    def _make_line_map(fmt: str):
+        def build(text: str) -> Dict[str, int]:
+            return _lines_build_line_map(text, fmt)
+
+        return build
+
+    for fmt in ("json", "yaml", "toml", "ini"):
+        _PLUGIN_REGISTRY.register(
+            _plugins_mod.ParserPlugin(
+                name=fmt,
+                extensions=_FORMAT_EXTENSIONS[fmt],
+                parse=_make_parse(fmt),
+                build_line_map=_make_line_map(fmt),
+            ),
+            replace=True,
+        )
+
+
+_register_builtin_plugins()
+
+# Discover external parser plugins (entry point group "cfgdrift.parsers").
+# Best-effort: individual failures are logged as warnings and never affect
+# the built-in parsers.
+_plugins_mod.discover_entry_points()

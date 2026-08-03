@@ -1,0 +1,118 @@
+# ① enable-autostart（三平台）
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as cli.py daemon enable-autostart
+    participant AM as AutostartManager
+    participant ST as Store
+    participant OS as systemd/launchd/schtasks
+
+    U->>CLI: --target P --baseline B --interval 300 [--user] [--dry-run] [--force]
+    CLI->>AM: enable(opts, dry_run)
+    AM->>AM: validate: target 存在 / baseline 存在(STore) / interval>=60 / fmt 合法
+    AM->>AM: 读 autostart.json → 幂等判定（同参 no-op / 异参需 --force）
+    alt --dry-run
+        AM->>AM: _render_systemd/_render_launchd/_render_schtasks(cfg)
+        AM-->>U: 打印工件全文 + autostart.json 内容 (exit 0, 零落盘)
+    else 实写
+        AM->>AM: 写 <home>/autostart.json
+        alt linux
+            AM->>OS: 写 unit 文件 + systemctl --user daemon-reload/enable
+        else darwin
+            AM->>OS: 写 plist + launchctl load -w
+        else win32
+            AM->>OS: schtasks /Create /TN cfgdrift-daemon /SC ONLOGON /F
+        end
+        AM-->>U: autostart enabled (scope=user) (exit 0)
+    end
+
+# ② alert 发送（规则级重试）
+sequenceDiagram
+    autonumber
+    participant W as DaemonWorker
+    participant DP as AlertDispatcher
+    participant SV as AlertStateStore
+    participant CH as Channel
+    participant RB as retry_with_backoff
+
+    W->>DP: dispatch_report(baseline, target, report)
+    DP->>DP: _rule_matches (enabled/基线/阈值) + 防抖 is_suppressed
+    DP->>DP: attempts, delays = rule.effective_retry(3, (1,5,30))
+    DP->>RB: retry_with_backoff(send_fn, attempts, delays)
+    loop 尝试 ≤ attempts 次
+        RB->>CH: send(payload)
+        alt 成功
+            RB-->>DP: used attempts
+            DP->>SV: record_success (冷却 600s 不变)
+        else ChannelError
+            Note over RB: sleep(delays[i]) 后重试（防抖不受影响）
+        end
+    end
+    Note over DP: 全部失败 → record_failure（同冷却窗口）→ logger.error
+
+# ③ report --html 数据流（CLI 与 Web 同源）
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as cli.py report --html
+    participant ST as Store
+    participant MK as SensitiveMasker
+    participant HR as HtmlReporter
+    participant W as FastAPI /api/reports/{id}/html
+
+    alt CLI
+        U->>CLI: report --scan-id N --html out.html
+        CLI->>ST: get_scan(N)
+        ST-->>CLI: payload (7.6)
+        CLI->>MK: mask_payload(payload)
+        CLI->>HR: render_html(payload["data"])
+        CLI-->>U: 写 out.html (单文件离线)
+    else Web 导出按钮
+        U->>W: GET /api/reports/N/html
+        W->>ST: get_scan(N)
+        W->>MK: mask_payload
+        W->>HR: render_html(data)
+        W-->>U: text/html → Blob 下载 report-N.html
+    end
+
+# ④ POST /api/compare
+sequenceDiagram
+    autonumber
+    participant SPA as SPA 环境对比视图
+    participant API as FastAPI POST /api/compare
+    participant CE as CompareEngine
+    participant ST as Store
+    participant MK as SensitiveMasker
+
+    SPA->>API: {env1, env2}
+    API->>API: 校验必填/不相同 → 400
+    API->>CE: load_environments(home) + resolve_baseline_name
+    API->>ST: get_baseline(name)（未采集 → ValueError）
+    alt 基线不存在
+        API-->>SPA: 404 "环境 X 未采集基线（baseline 'X' not found）"
+    else 正常
+        API->>CE: compare([env1, env2], env_map, severity_rules, masker)
+        CE->>MK: mask_item（显示出口脱敏）
+        API->>API: 注入 snippet_root（按行号来源侧）
+        API-->>SPA: ok(CompareReport.to_dict())
+        SPA->>SPA: 渲染摘要 + 严重度分布 + 差异表（行号可点击）
+    end
+
+# ⑤ 插件解析分发
+sequenceDiagram
+    autonumber
+    participant CLI as cli.py scan --format mydsl
+    participant PD as ParserDispatch (parser.py)
+    participant RG as PluginRegistry
+    participant PL as ParserPlugin(mydsl)
+
+    CLI->>PD: parse_file_lines(path, "mydsl")
+    PD->>PD: validate_format("mydsl") → 注册表命中
+    PD->>RG: get("mydsl")
+    RG-->>PD: ParserPlugin
+    PD->>PL: parse(text)
+    PL-->>PD: 原始 dict/list/scalar
+    PD->>PD: _normalize + _wrap_top_level（与内置同路径）
+    PD->>PL: build_line_map(text)（可选，缺省 {}）
+    PD-->>CLI: (semantic tree, line_map)
+    Note over CLI: 未注册格式 → ValueError: invalid format + 注册指引（exit 2）

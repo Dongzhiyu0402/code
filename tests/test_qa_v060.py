@@ -856,5 +856,5 @@ class TestRegression:
         import cfgdrift
         from cfgdrift import _cfgdrift
 
-        assert cfgdrift.__version__ == "0.4.0"
-        assert _cfgdrift.version() == "0.4.0-c"
+        assert cfgdrift.__version__ == "0.5.0"
+        assert _cfgdrift.version() == "0.5.0-c"

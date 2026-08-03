@@ -118,6 +118,12 @@ class AlertRule:
     scopes the rule to a single baseline (``None`` = all baselines).
     ``config`` holds the channel-specific settings (see ``alerts.yaml``
     schema in ``docs/system_design.md`` appendix B).
+
+    v0.5.0: rule-level retry.  ``retry_count`` is the total number of send
+    attempts (>= 1) and ``retry_delays`` the list of seconds to wait between
+    attempts (elements >= 0).  Both are optional — when omitted the rule
+    falls back to the dispatcher's global defaults (3 attempts, 1s/5s/30s),
+    so old ``alerts.yaml`` files keep working unchanged (D4).
     """
 
     name: str
@@ -126,6 +132,9 @@ class AlertRule:
     baseline: Optional[str] = None
     enabled: bool = True
     config: dict = field(default_factory=dict)
+    # v0.5.0: rule-level retry (None = use the global default).
+    retry_count: Optional[int] = None  # total attempts, >= 1
+    retry_delays: Optional[List[float]] = None  # inter-attempt waits, >= 0
 
     def __post_init__(self) -> None:
         if not self.name or not isinstance(self.name, str):
@@ -139,9 +148,77 @@ class AlertRule:
             self.severity = Severity(self.severity)
         if not isinstance(self.config, dict):
             raise ValueError("alert rule config must be a mapping")
+        if self.retry_count is not None:
+            if isinstance(self.retry_count, bool):
+                raise ValueError(
+                    "alert rule %r retry_count must be an integer >= 1" % self.name
+                )
+            try:
+                rc = int(self.retry_count)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "alert rule %r retry_count must be an integer >= 1"
+                    % self.name
+                ) from None
+            if rc < 1:
+                raise ValueError(
+                    "alert rule %r retry_count must be >= 1 (got %r)"
+                    % (self.name, self.retry_count)
+                )
+            self.retry_count = rc
+        if self.retry_delays is not None:
+            if not isinstance(self.retry_delays, (list, tuple)):
+                raise ValueError(
+                    "alert rule %r retry_delays must be a list of "
+                    "non-negative numbers" % self.name
+                )
+            if len(self.retry_delays) == 0:
+                raise ValueError(
+                    "alert rule %r retry_delays must not be empty" % self.name
+                )
+            delays: List[float] = []
+            for delay in self.retry_delays:
+                if isinstance(delay, bool):
+                    raise ValueError(
+                        "alert rule %r retry_delays must contain numbers"
+                        % self.name
+                    )
+                try:
+                    fd = float(delay)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "alert rule %r retry_delays must contain numbers"
+                        % self.name
+                    ) from None
+                if fd < 0:
+                    raise ValueError(
+                        "alert rule %r retry_delays must be >= 0 (got %r)"
+                        % (self.name, delay)
+                    )
+                delays.append(fd)
+            self.retry_delays = delays
+
+    def effective_retry(
+        self, default_attempts: int = 3, default_delays: tuple = (1, 5, 30)
+    ) -> tuple:
+        """Resolve the effective retry strategy (D5 semantics).
+
+        Rule-level settings take precedence over the global defaults:
+
+        - ``retry_count`` given -> ``(count, global_default_delays)``;
+        - only ``retry_delays`` given -> ``(len(delays) + 1, delays)``;
+        - neither given -> ``(default_attempts, default_delays)``.
+        """
+        if self.retry_count is not None:
+            return int(self.retry_count), tuple(default_delays)
+        if self.retry_delays is not None:
+            return len(self.retry_delays) + 1, tuple(
+                float(d) for d in self.retry_delays
+            )
+        return int(default_attempts), tuple(default_delays)
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "name": self.name,
             "type": self.type,
             "severity": self.severity.value,
@@ -149,6 +226,13 @@ class AlertRule:
             "enabled": self.enabled,
             "config": self.config,
         }
+        # Optional fields are written only when configured, keeping old
+        # alerts.yaml round-trips clean and preserving the v1 schema.
+        if self.retry_count is not None:
+            out["retry_count"] = self.retry_count
+        if self.retry_delays is not None:
+            out["retry_delays"] = list(self.retry_delays)
+        return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AlertRule":
@@ -176,6 +260,24 @@ class AlertRule:
         baseline = data.get("baseline")
         if baseline is not None and not isinstance(baseline, str):
             raise ValueError("alert rule %r baseline must be a string" % name)
+        # v0.5.0: optional retry fields; absent keys default to None so old
+        # alerts.yaml files (version 1) load unchanged.
+        retry_count = data.get("retry_count")
+        if retry_count is not None and not isinstance(retry_count, int):
+            if not isinstance(retry_count, bool):
+                try:
+                    retry_count = int(retry_count)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "alert rule %r retry_count must be an integer >= 1"
+                        % name
+                    ) from None
+        retry_delays = data.get("retry_delays")
+        if retry_delays is not None and not isinstance(retry_delays, (list, tuple)):
+            raise ValueError(
+                "alert rule %r retry_delays must be a list of non-negative "
+                "numbers" % name
+            )
         return cls(
             name=name,
             type=rule_type,
@@ -183,6 +285,8 @@ class AlertRule:
             baseline=baseline,
             enabled=bool(data.get("enabled", True)),
             config=config,
+            retry_count=retry_count,
+            retry_delays=retry_delays,
         )
 
 

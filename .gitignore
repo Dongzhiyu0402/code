@@ -53,3 +53,14 @@ _qa_*.txt
 _qa_r5*.txt
 _qa_py38_*/
 _qa_wheel_*/
+*v050*.txt
+.wheels_v050*/
+cli_version*.txt
+ver_check.txt
+env_check.txt
+.baseline_v050.txt
+.daemon_test.log
+.retest_v050.txt
+demo_check*/
+demo_staging/
+dist-v040/

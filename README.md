@@ -6,8 +6,9 @@
 
 - **精准检测**：检出新增 / 删除 / 修改 / 类型变化四类漂移，按 CRITICAL / WARN / INFO 严重度分级，误报趋近于零
 - **闭环可操作**：采集 → 解析 → 基线 → 比对 → 报告全流程一条命令打通；基线支持版本化与回滚，SQLite 持久化历史可追溯
-- **无人值守**：守护进程（daemon）后台常驻定期扫描，检出漂移自动触发 webhook / 邮件 / 脚本三通道告警，含防抖去重与失败重试
-- **工程友好**：退出码 0/1/2 契约可直接接入 CI/CD；JSON 报告导出；可选本地 Web 仪表盘（时间线、严重度分布）
+- **无人值守**：守护进程（daemon）后台常驻定期扫描，检出漂移自动触发 webhook / 邮件 / 脚本三通道告警，含防抖去重与失败重试（**规则级重试可配**）；支持**开机自启**（systemd / launchd / schtasks 三平台）
+- **工程友好**：退出码 0/1/2 契约可直接接入 CI/CD；JSON / **单文件离线 HTML** 报告导出；可选本地 Web 仪表盘（时间线、严重度分布、**环境对比**）
+- **可扩展**：**插件化解析器接口**（entry point `cfgdrift.parsers` + 装饰器注册），支持任意自定义配置文件格式
 - **随处可装**：C 核心解析 + 纯 Python 兜底，任意 Python 3.8+ 免编译器安装，Windows / Linux / macOS 跨平台
 
 适合配置变更审计、安全合规检查、CI 门禁与日常运维巡检场景。
@@ -19,18 +20,21 @@
 - `cfgdrift baseline create|list|show|rollback`：基线版本化管理
 - `cfgdrift diff --baseline NAME`：与基线比对，输出漂移报告（含 `file:line` 行号，`--no-line` 可关闭）
 - `cfgdrift compare ENV1 ENV2...`：多环境基线对比，头部展示双方基线版本 `compare A -> B (vX vs vY)`，支持 `environments.yaml` 映射与 `--json`
-- `cfgdrift severity add|list|remove|enable|disable`：自定义严重度覆盖规则（`severity.yaml`，非法正则报错 exit 2）
-- `cfgdrift report --json out.json`：导出 JSON 报告
+- `cfgdrift severity add|list|remove|enable|disable`：自定义严重度覆盖规则（`severity.yaml`，非法正则报错 exit 2）。注意：`severity add --key-pattern` / `--value-pattern` / `--file-pattern` 均为**正则**；`masking.yaml` 的 `patterns` 是 **glob**（fnmatch）语义，二者不可混用
+- `cfgdrift report --json out.json`：导出 JSON 报告；`cfgdrift report --html out.html`：导出**单文件离线 HTML**（摘要卡 + 严重度分布 + 变更列表，零外部依赖）
 - `cfgdrift ignore add|list|remove`：忽略规则（exact / prefix / regex）
-- `cfgdrift serve`：启动本地 Web 仪表盘（`127.0.0.1:8080`，需 `[web]` extra）
-- **敏感值脱敏**：终端 / JSON 报告 / Web API / 告警 payload 四个显示出口对 `password` / `token` / `secret` 等 13 类敏感键自动打码（`masking.yaml` 可定制，数据库始终保存原始值）
+- `cfgdrift serve`：启动本地 Web 仪表盘（`127.0.0.1:8080`，需 `[web]` extra），支持**环境对比**视图与报告「导出 HTML」按钮
+- `cfgdrift daemon enable-autostart|disable-autostart|autostart-status`：开机自启管理（systemd / launchd / schtasks，`--user` 默认 / `--system` 可选 / `--dry-run` 预览 / 幂等语义）
+- `cfgdrift alert add --retry-count N --retry-delay ...`：规则级告警重试（总尝试次数 + 尝试间等待，缺省回退全局默认 3 次 1s/5s/30s）
+- **敏感值脱敏**：终端 / JSON 报告 / HTML 报告 / Web API / 告警 payload 五个显示出口对 `password` / `token` / `secret` 等 13 类敏感键自动打码（`masking.yaml` 可定制，数据库始终保存原始值）
 - **行号定位**：diff / compare 输出标明 `file:line`，便于快速定位漂移源
+- **自定义解析器插件**：`--format <plugin>` 支持第三方解析格式（见下文「自定义解析器插件」）
 
 退出码：`0`=无漂移，`1`=检出漂移，`2`=错误。
 
 ## 安装
 
-自 v0.2.0 起（当前版本 v0.4.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
+自 v0.2.0 起（当前版本 v0.5.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
 的通用包：C 扩展是可选加速器，未编译或安装失败时自动降级到纯 Python 解析器。
 
 ```bash
@@ -43,9 +47,9 @@ pip install "cfgdrift[dev]"     # 含测试依赖
 
 | 发布件 | 适用用户 | 说明 |
 |--------|----------|------|
-| `cfgdrift-0.4.0-py3-none-any.whl` | 所有 Python 3.8+ | 纯 Python 通用 wheel（默认主发布件） |
-| `cfgdrift-0.4.0-cp313-*-*.whl` | CPython 3.13 | 可选 C 加速平台 wheel（更快的 JSON/TOML/INI 解析） |
-| `cfgdrift-0.4.0.tar.gz`（sdist） | 需要本地编译 | 携带 C 源码，`pip install` 时尝试编译，失败自动降级 |
+| `cfgdrift-0.5.0-py3-none-any.whl` | 所有 Python 3.8+ | 纯 Python 通用 wheel（默认主发布件） |
+| `cfgdrift-0.5.0-cp313-*-*.whl` | CPython 3.13 | 可选 C 加速平台 wheel（更快的 JSON/TOML/INI 解析） |
+| `cfgdrift-0.5.0.tar.gz`（sdist） | 需要本地编译 | 携带 C 源码，`pip install` 时尝试编译，失败自动降级 |
 
 pip 的标签优先级天然让 CPython 3.13 用户拿到加速件、其他版本拿到通用件。
 
@@ -108,3 +112,102 @@ cfgdrift serve                                   # 打开 http://127.0.0.1:8080
 ## 数据目录
 
 默认 `~/.cfgdrift/`，可用环境变量 `CFGDRIFT_HOME` 或 CLI 全局选项 `--store PATH` 覆盖。
+
+## daemon 开机自启（v0.5.0）
+
+```bash
+# Linux: 写 ~/.config/systemd/user/cfgdrift.service（--user 默认）并 systemctl --user enable
+# macOS: 写 ~/Library/LaunchAgents/com.cfgdrift.daemon.plist 并 launchctl load -w
+# Windows: 创建计划任务 schtasks /Create /TN cfgdrift-daemon /SC ONLOGON
+cfgdrift daemon enable-autostart --target /etc/nginx --baseline prod --interval 300
+cfgdrift daemon enable-autostart --target /etc/nginx --baseline prod --dry-run   # 预览，零落盘
+cfgdrift daemon disable-autostart
+cfgdrift daemon autostart-status        # 退出码 0=enabled / 1=disabled / 2=error
+```
+
+- 自启配置唯一真源为 `<home>/autostart.json`，与平台工件双写双清
+- `enable` 前校验：target 存在、baseline 存在、`--interval >= 60`、`--format` 合法
+- 幂等：已启用且参数一致 → no-op（exit 0）；参数不同 → 需 `--force` 覆盖（否则 exit 2）
+- `--system` 为显式可选（需要 root/管理员权限）
+
+## 告警重试可配（v0.5.0）
+
+```bash
+# 规则级：总尝试次数 5，间隔用全局默认 (1,5,30)
+cfgdrift alert add --name nginx-webhook --type webhook --url http://x --retry-count 5
+# 规则级：只给间隔 → 尝试次数 = len(delays)+1（此处 4 次）
+cfgdrift alert add --name ops-email --type email --smtp-host ... --retry-delay 2,10,60
+# 逗号分隔与重复两种写法等价
+cfgdrift alert add --name x --type webhook --url http://x --retry-delay 1 --retry-delay 5 --retry-delay 30
+```
+
+- `retry_count` = 总尝试次数（默认 3，≥1）；`retry_delays` = 尝试间等待秒数列表（元素 ≥0）
+- 规则级 > 全局默认；`alert list` 显示 `retry=3/1,5,30` 或 `retry=default`；防抖（冷却 600s）不变
+
+## HTML 报告导出（v0.5.0）
+
+```bash
+cfgdrift report --scan-id 3 --html out.html   # 单文件离线 HTML，可直接浏览器打开
+```
+
+- 摘要卡 + 严重度分布条 + 变更列表（严重度徽标 / 键路径 / 变更类型 / 文件:行 / 旧值→新值 / 规则）
+- `masked=true` 的项显示「已脱敏」徽标；严重度配色与 Web 仪表盘一致
+- Web 报告页同样提供「导出 HTML」按钮（`GET /api/reports/{scan_id}/html`）
+
+## 自定义解析器插件（v0.5.0）
+
+`--format` 接受内置格式 `auto/json/yaml/toml/ini` 之外，还接受**已注册的插件名**。插件返回
+原始树（dict/list/scalar），由引擎统一归一化为语义树；可选的 `build_line_map` 提供
+`{key_path: line}` 行号映射（未提供则行号为 None，渲染不输出 `:N`）。
+
+### 方式 A：装饰器注册（进程内，import 时生效）
+
+```python
+# mydsl_plugin.py
+from cfgdrift.core.plugins import register_plugin
+
+def _parse_mydsl(text: str):
+    tree = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            tree[k.strip()] = v.strip()
+    return tree
+
+def _line_map(text: str):
+    return {k.strip(): i + 1
+            for i, line in enumerate(text.splitlines())
+            if "=" in line
+            for k in [line.split("=", 1)[0]]}
+
+@register_plugin("mydsl", extensions=(".dsl",), line_map=_line_map)
+def parse_mydsl(text: str):
+    return _parse_mydsl(text)
+```
+
+```bash
+cfgdrift scan app.dsl --format mydsl        # 扩展名 .dsl 也可自动识别
+```
+
+### 方式 B：entry point 注册（打包分发，优先于同名装饰器）
+
+```toml
+# pyproject.toml（插件包）
+[project.entry-points."cfgdrift.parsers"]
+mydsl = "mydsl_plugin:plugin"
+```
+
+```python
+# mydsl_plugin.py —— plugin 可以是 ParserPlugin 实例或 (parse_fn, {"extensions":..., "line_map":...})
+from cfgdrift.core.plugins import ParserPlugin
+
+def parse_mydsl(text: str):
+    return {...}
+
+plugin = ParserPlugin(name="mydsl", extensions=(".dsl",), parse=parse_mydsl,
+                      build_line_map=lambda text: {...})
+```
+
+- 未注册的 `--format` 报错包含注册指引（`cfgdrift.parsers` entry point 组 / `register_plugin`）
+- 同名冲突 entry point 覆盖装饰器；单个插件加载失败仅 warning，不影响内置解析器
+- 插件发现使用 Python 3.8+ 标准库 `importlib.metadata`，零新增依赖

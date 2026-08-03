@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cfgdrift"
-version = "0.4.0"
+version = "0.5.0"
 description = "Semantic-level configuration drift detection system (JSON/TOML/INI parsed in C or pure Python, YAML via PyYAML)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -32,6 +32,10 @@ web = [
 ]
 dev = [
     "pytest>=8.0",
+    # Web 仪表盘测试所需（v0.4.0+）：让 dev 环境与 CI 矩阵一次装齐
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "httpx2",
 ]
 
 [project.scripts]

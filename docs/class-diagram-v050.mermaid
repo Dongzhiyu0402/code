@@ -1,0 +1,65 @@
+classDiagram
+    class AutostartManager {
+        +__init__(home: str, store_path: Optional~str~)
+        +enable(opts: dict, dry_run: bool) int
+        +disable(dry_run: bool) int
+        +status() int
+        +status_dict() dict
+        +validate(opts: dict) None
+        +autostart_config_path(home: str) str
+        +_render_systemd(cfg: dict) str
+        +_render_launchd(cfg: dict) str
+        +_render_schtasks(cfg: dict) str
+        +_apply(cfg: dict, dry_run: bool) None
+        +_remove(dry_run: bool) None
+    }
+    class ParserPlugin {
+        <<protocol>>
+        +str name
+        +tuple extensions
+        +parse(text: str) Any
+        +build_line_map(text: str) dict
+    }
+    class PluginRegistry {
+        +register(plugin: ParserPlugin, replace: bool) None
+        +get(name: str) Optional~ParserPlugin~
+        +by_extension(ext: str) Optional~str~
+        +custom_names() list
+        +load_entry_points(group: str) int
+    }
+    class HtmlReporter {
+        +render_html(data: dict, title: str) str
+        +_summary_cards(data: dict) str
+        +_severity_distribution(items: list) str
+        +_items_table(items: list) str
+    }
+    class AlertRule {
+        +str name
+        +str type
+        +Severity severity
+        +Optional~str~ baseline
+        +bool enabled
+        +dict config
+        +Optional~int~ retry_count
+        +Optional~list~ retry_delays
+        +effective_retry(default_attempts: int, default_delays: tuple) tuple
+        +to_dict() dict
+        +from_dict(data) AlertRule
+    }
+    class AlertDispatcher {
+        +dispatch_report(baseline_name, target, report) List~DispatchResult~
+        +test_rule(rule) DispatchResult
+        +_send_with_retry(channel, payload, rule) tuple
+    }
+    class CompareApi {
+        +POST /api/compare
+        +GET /api/reports/{scan_id}/html
+    }
+
+    AutostartManager ..> worker.build_worker_command : 复用 (D9)
+    ParserDispatch ..> PluginRegistry : 分发自定义格式 (既有 parser.py)
+    ParserDispatch ..> ParserPlugin : 调用 parse/build_line_map
+    HtmlReporter ..> SensitiveMasker : 已脱敏 data (D6)
+    CompareApi ..> CompareEngine : 复用 (既有 core/compare.py)
+    AlertDispatcher ..> AlertRule : effective_retry (规则级)
+    AlertRule ..> retry_with_backoff : attempts/delays (既有 channels.py)

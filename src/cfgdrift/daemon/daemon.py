@@ -332,31 +332,19 @@ class DaemonManager:
     # ------------------------------------------------------------------
 
     def _worker_command(self, opts: Dict[str, Any]) -> List[str]:
-        """Build the worker argv for the Windows child process."""
-        cmd = [
-            sys.executable,
-            "-m",
-            "cfgdrift.daemon.worker",
-            "--home", self.home,
-            "--store", opts["store"],
-            "--baseline", opts["baseline"],
-            "--format", opts.get("fmt", "auto"),
-            "--interval", str(opts.get("interval", 300)),
-            "--pid-file", self.pid_file,
-            "--stop-file", self.stop_file,
-            "--info-file", self.info_file,
-            "--log-file", opts.get("log_file") or self.log_file,
-            "--log-level", opts.get("log_level", "INFO"),
-        ]
-        alerts_config = opts.get("alerts_config")
-        alert_state = opts.get("alert_state")
-        if alerts_config:
-            cmd += ["--alerts-config", alerts_config]
-        if alert_state:
-            cmd += ["--alert-state", alert_state]
-        for target in opts.get("targets", []):
-            cmd += ["--path", target]
-        return cmd
+        """Build the worker argv for the Windows child process.
+
+        v0.5.0 (D9): delegates to the single source of truth
+        :func:`cfgdrift.daemon.worker.build_worker_command`; the PID /
+        sentinel / info files are injected here so the produced command is
+        unchanged from v0.4.0.
+        """
+        merged = dict(opts)
+        merged.setdefault("pid_file", self.pid_file)
+        merged.setdefault("stop_file", self.stop_file)
+        merged.setdefault("info_file", self.info_file)
+        merged.setdefault("log_file", opts.get("log_file") or self.log_file)
+        return worker_mod.build_worker_command(self.home, merged)
 
     def _spawn_worker_win32(self, opts: Dict[str, Any]) -> int:
         os.makedirs(self.log_dir, exist_ok=True)

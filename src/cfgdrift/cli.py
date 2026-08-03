@@ -23,8 +23,9 @@ from .core.compare import CompareEngine
 from .core.differ import SemanticDiffer
 from .core.masker import SensitiveMasker, masking_config_path
 from .core.model import IgnoreRule, Report, ScanSummary, Severity
-from .core.parser import parse_file
+from .core.parser import parse_file, validate_format
 from .core.reporter import Reporter
+from .daemon.autostart import AutostartManager
 from .daemon.daemon import DaemonManager
 from .daemon.worker import main as worker_main
 from .rules.ignore import make_rule
@@ -220,8 +221,7 @@ def _use_color(ctx: click.Context) -> bool:
     "--format",
     "fmt",
     default="auto",
-    type=click.Choice(["auto", "json", "yaml", "toml", "ini"]),
-    help="Config format (auto = by extension).",
+    help="Config format (auto/json/yaml/toml/ini or a registered parser plugin, v0.5.0).",
 )
 @click.option("--watch", is_flag=True, help="Watch the path and re-scan periodically.")
 @click.option("--interval", default=60, type=int, help="Watch interval in seconds.")
@@ -290,7 +290,7 @@ def baseline() -> None:
 @click.option("--scan-root", "scan_root", required=True, type=click.Path(exists=True),
               help="File or directory to snapshot.")
 @click.option("--format", "fmt", default="auto",
-              type=click.Choice(["auto", "json", "yaml", "toml", "ini"]))
+              help="Config format (auto/json/yaml/toml/ini or a registered parser plugin, v0.5.0).")
 @click.option("--description", default="")
 @click.pass_context
 def baseline_create(ctx: click.Context, name: str, scan_root: str, fmt: str,
@@ -459,7 +459,7 @@ def _run_compare(
 @click.option("--baseline", "baseline_name", default=None,
               help="Baseline name (required unless --compare).")
 @click.option("--format", "fmt", default="auto",
-              type=click.Choice(["auto", "json", "yaml", "toml", "ini"]))
+              help="Config format (auto/json/yaml/toml/ini or a registered parser plugin, v0.5.0).")
 @click.option("--color/--no-color", default=True, help="Colored terminal output.")
 @click.option("--compare", "compare_mode", is_flag=True,
               help="Compare two baselines by environment name (--env1/--env2).")
@@ -536,12 +536,16 @@ def compare(ctx: click.Context, environments: tuple, severity_filter: Optional[s
               help="Scan id to render (default: latest scan).")
 @click.option("--json", "json_path", type=click.Path(), default=None,
               help="Write the JSON report to a file.")
+@click.option("--html", "html_path", type=click.Path(), default=None,
+              help="Write a single-file offline HTML report to a file (v0.5.0).")
 @click.option("--color/--no-color", default=True, help="Colored terminal output.")
 @click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
 @click.pass_context
 def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
-           color: bool, no_line: bool) -> int:
-    """Render a stored scan report (terminal or JSON)."""
+           html_path: Optional[str], color: bool, no_line: bool) -> int:
+    """Render a stored scan report (terminal, JSON or standalone HTML)."""
+    if json_path and html_path:
+        raise ValueError("--json and --html are mutually exclusive")
     store = _open_store(ctx)
     if scan_id is None:
         scans = store.list_scans(limit=1)
@@ -556,6 +560,20 @@ def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
         raise ValueError(payload.get("message", "scan report is invalid"))
 
     data = payload["data"]
+
+    if html_path:
+        # D6: same data source as the Web export — get_scan payload masked
+        # at the display exit, then rendered by the shared HtmlReporter.
+        masker = _build_masker()
+        masker.mask_payload(payload)
+        from .core.htmlreport import HtmlReporter
+
+        html = HtmlReporter.render_html(data, title="cfgdrift report #%s" % scan_id)
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        click.echo("report written to %s" % html_path)
+        return 0
+
     summary_data = data.get("summary", {})
     summary = ScanSummary(
         added=int(summary_data.get("added", 0)),
@@ -845,7 +863,7 @@ def daemon() -> None:
 @click.option("--baseline", "baseline_name", required=True,
               help="Baseline name to diff against.")
 @click.option("--format", "fmt", default="auto",
-              type=click.Choice(["auto", "json", "yaml", "toml", "ini"]))
+              help="Config format (auto/json/yaml/toml/ini or a registered parser plugin, v0.5.0).")
 @click.option("--interval", default=300, type=int,
               help="Scan interval in seconds (default: 300).")
 @click.option("--log-file", default=None, help="Override daemon log file path.")
@@ -867,6 +885,8 @@ def daemon_start(
     """Start the daemon (background by default)."""
     if interval <= 0:
         raise ValueError("--interval must be a positive integer")
+    # v0.5.0: fail fast on an invalid --format before forking/spawning.
+    validate_format(fmt)
 
     home = _daemon_home()
     store_path = ctx.obj.get("store") or os.path.join(home, "cfgdrift.db")
@@ -972,6 +992,75 @@ def daemon_status(ctx: click.Context) -> int:
     return code
 
 
+@daemon.command("enable-autostart")
+@click.option("--target", "--path", "targets", multiple=True, required=True,
+              type=click.Path(exists=True),
+              help="Path to monitor (repeatable; file or directory).")
+@click.option("--baseline", "baseline_name", required=True,
+              help="Baseline name to diff against.")
+@click.option("--format", "fmt", default="auto",
+              help="Config format (auto/json/yaml/toml/ini or a registered parser plugin).")
+@click.option("--interval", default=300, type=int,
+              help="Scan interval in seconds (autostart requires >= 60; default: 300).")
+@click.option("--user/--system", "scope_user", default=True,
+              help="Install a user-level unit (default) or a system-wide one (needs root).")
+@click.option("--dry-run", is_flag=True,
+              help="Print the unit/command + autostart.json without writing anything.")
+@click.option("--force", is_flag=True,
+              help="Overwrite an existing autostart configured with different parameters.")
+@click.pass_context
+def daemon_enable_autostart(
+    ctx: click.Context,
+    targets: tuple,
+    baseline_name: str,
+    fmt: str,
+    interval: int,
+    scope_user: bool,
+    dry_run: bool,
+    force: bool,
+) -> int:
+    """Install the daemon autostart (systemd / launchd / schtasks).
+
+    The single source of truth is <home>/autostart.json; the platform
+    artifact is written/removed together with it (double-write / double-clear).
+    """
+    if interval <= 0:
+        raise ValueError("--interval must be a positive integer")
+    validate_format(fmt)
+    home = _daemon_home()
+    store_path = ctx.obj.get("store") or os.path.join(home, "cfgdrift.db")
+    manager = AutostartManager(home, store_path)
+    opts = {
+        "targets": list(targets),
+        "baseline": baseline_name,
+        "fmt": fmt,
+        "interval": interval,
+        "store": store_path,
+        "log_file": os.path.join(home, "logs", "daemon.log"),
+        "log_level": "INFO",
+        "scope": "user" if scope_user else "system",
+    }
+    return manager.enable(opts, dry_run=dry_run)
+
+
+@daemon.command("disable-autostart")
+@click.option("--dry-run", is_flag=True,
+              help="Print the removal commands without touching disk.")
+@click.pass_context
+def daemon_disable_autostart(ctx: click.Context, dry_run: bool) -> int:
+    """Remove the daemon autostart artifact + autostart.json (idempotent)."""
+    manager = AutostartManager(_daemon_home())
+    return manager.disable(dry_run=dry_run)
+
+
+@daemon.command("autostart-status")
+@click.pass_context
+def daemon_autostart_status(ctx: click.Context) -> int:
+    """Show autostart status (0 enabled / 1 disabled / 2 error)."""
+    manager = AutostartManager(_daemon_home())
+    return manager.status()
+
+
 # ---------------------------------------------------------------------------
 # alert group (v0.3.0)
 # ---------------------------------------------------------------------------
@@ -1012,6 +1101,12 @@ def alert() -> None:
               help="Script argument (repeatable; supports {baseline}/{env:VAR}).")
 @click.option("--timeout", type=float, default=None,
               help="Channel timeout in seconds.")
+# v0.5.0: rule-level retry (optional; falls back to the global default).
+@click.option("--retry-count", "retry_count", type=int, default=None,
+              help="Total send attempts (>= 1; default: global 3).")
+@click.option("--retry-delay", "retry_delays", multiple=True, default=None,
+              help="Seconds to wait between attempts (repeatable or comma-separated; "
+                   "attempts = len(delays)+1 when only delays are given).")
 @click.pass_context
 def alert_add(
     ctx: click.Context,
@@ -1033,6 +1128,8 @@ def alert_add(
     command: Optional[str],
     script_args: tuple,
     timeout: Optional[float],
+    retry_count: Optional[int],
+    retry_delays: tuple,
 ) -> int:
     """Add an alert rule to <home>/alerts.yaml."""
     home = _daemon_home()
@@ -1091,10 +1188,27 @@ def alert_add(
         baseline=baseline_name,
         enabled=True,
         config=config,
+        retry_count=retry_count,
+        retry_delays=_flatten_retry_delays(retry_delays),
     )
     AlertConfig.add_rule(path, rule)
     click.echo("alert rule %r added (type=%s severity=%s)" % (name, rule_type, severity))
     return 0
+
+
+def _flatten_retry_delays(values: tuple) -> Optional[List[float]]:
+    """Flatten ``--retry-delay`` values (comma-separated and/or repeated).
+
+    ``("1,5,30",)`` and ``("1", "5", "30")`` both produce ``[1.0, 5.0, 30.0]``.
+    Returns ``None`` when no values were given.
+    """
+    out: List[float] = []
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                out.append(float(part))
+    return out or None
 
 
 @alert.command("list")
@@ -1108,9 +1222,24 @@ def alert_list(ctx: click.Context) -> int:
         return 0
     for r in rules:
         scope = r.baseline if r.baseline else "all"
+        # v0.5.0: show the effective retry strategy (rule > global default).
+        retry_text = "default"
+        if r.retry_count is not None or r.retry_delays is not None:
+            attempts, delays = r.effective_retry(3, (1, 5, 30))
+            retry_text = "%d/%s" % (
+                attempts,
+                ",".join(str(float(d)) for d in delays),
+            )
         click.echo(
-            "# %s type=%s severity=%s baseline=%s enabled=%s"
-            % (r.name, r.type, r.severity.value, scope, "yes" if r.enabled else "no")
+            "# %s type=%s severity=%s baseline=%s enabled=%s retry=%s"
+            % (
+                r.name,
+                r.type,
+                r.severity.value,
+                scope,
+                "yes" if r.enabled else "no",
+                retry_text,
+            )
         )
     return 0
 

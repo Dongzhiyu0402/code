@@ -353,6 +353,55 @@ class DaemonWorker:
 
 
 # ---------------------------------------------------------------------------
+# Worker command single source of truth (D9, v0.5.0)
+# ---------------------------------------------------------------------------
+
+def build_worker_command(home: str, opts: Dict[str, Any]) -> List[str]:
+    """Build the daemon worker argv — the only construction point (D9).
+
+    ``DaemonManager._worker_command`` and ``AutostartManager`` both delegate
+    here so autostart units and ``daemon start`` can never drift apart.
+
+    ``opts`` supports the keys used by the daemon CLI: ``store`` /
+    ``baseline`` / ``fmt`` / ``interval`` / ``targets`` (or ``paths``) /
+    ``log_file`` / ``log_level`` and the optional ``pid_file`` / ``stop_file``
+    / ``info_file`` / ``alerts_config`` / ``alert_state``.  PID/sentinel/
+    info flags are emitted only when provided (autostart units omit them).
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "cfgdrift.daemon.worker",
+        "--home", os.path.abspath(home),
+        "--store", opts["store"],
+        "--baseline", opts["baseline"],
+        "--format", opts.get("fmt", "auto"),
+        "--interval", str(opts.get("interval", _DEFAULT_INTERVAL)),
+    ]
+    pid_file = opts.get("pid_file")
+    stop_file = opts.get("stop_file")
+    info_file = opts.get("info_file")
+    if pid_file:
+        cmd += ["--pid-file", pid_file]
+    if stop_file:
+        cmd += ["--stop-file", stop_file]
+    if info_file:
+        cmd += ["--info-file", info_file]
+    log_file = opts.get("log_file") or os.path.join(home, "logs", "daemon.log")
+    cmd += ["--log-file", log_file]
+    cmd += ["--log-level", opts.get("log_level", "INFO")]
+    alerts_config = opts.get("alerts_config")
+    alert_state = opts.get("alert_state")
+    if alerts_config:
+        cmd += ["--alerts-config", alerts_config]
+    if alert_state:
+        cmd += ["--alert-state", alert_state]
+    for target in opts.get("targets", []) or opts.get("paths", []):
+        cmd += ["--path", target]
+    return cmd
+
+
+# ---------------------------------------------------------------------------
 # CLI entry points
 # ---------------------------------------------------------------------------
 
@@ -459,8 +508,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Target path to monitor (repeatable).",
     )
     parser.add_argument("--baseline", required=True, help="Baseline name.")
+    # v0.5.0: free string (D8) — the runtime validate_format accepts built-in
+    # formats plus registered parser plugins and gives a readable error.
     parser.add_argument("--format", default="auto",
-                        choices=["auto", "json", "yaml", "toml", "ini"])
+                        help="Config format (auto/json/yaml/toml/ini or a registered plugin name).")
     parser.add_argument("--interval", type=int, default=_DEFAULT_INTERVAL)
     parser.add_argument("--pid-file", default=None)
     parser.add_argument("--stop-file", default=None)

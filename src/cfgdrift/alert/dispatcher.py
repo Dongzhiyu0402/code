@@ -146,7 +146,7 @@ class AlertDispatcher:
                 )
                 continue
 
-            sent, attempts, error = self._send_with_retry(channel, payload)
+            sent, attempts, error = self._send_with_retry(channel, payload, rule)
             if sent:
                 self.state.record_success(
                     key, dict(meta, attempts=attempts)
@@ -199,24 +199,28 @@ class AlertDispatcher:
         return results
 
     def test_rule(self, rule: AlertRule) -> DispatchResult:
-        """Connectivity test for ``alert test`` (bypasses dedupe/cooldown)."""
+        """Connectivity test for ``alert test`` (bypasses dedupe/cooldown).
+
+        v0.5.0: the rule-level retry policy is honored (rule > global).
+        """
         payload = build_test_payload(self.version)
+        attempts, delays = rule.effective_retry(self.retry_attempts, self.retry_delays)
         try:
             channel = build_channel(rule)
-            attempts = retry_with_backoff(
+            used = retry_with_backoff(
                 lambda: channel.send(payload),
-                attempts=self.retry_attempts,
-                delays=self.retry_delays,
+                attempts=attempts,
+                delays=delays,
                 sleep_fn=self.sleep_fn,
             )
-            logger.info("alert test %s ok (attempts=%d)", rule.name, attempts)
+            logger.info("alert test %s ok (attempts=%d)", rule.name, used)
             return DispatchResult(
                 rule=rule,
                 fingerprint="",
                 key="",
                 attempted=True,
                 sent=True,
-                attempts=attempts,
+                attempts=used,
                 error=None,
             )
         except ChannelError as exc:
@@ -227,7 +231,7 @@ class AlertDispatcher:
                 key="",
                 attempted=True,
                 sent=False,
-                attempts=self.retry_attempts,
+                attempts=attempts,
                 error=str(exc),
             )
 
@@ -278,16 +282,24 @@ class AlertDispatcher:
         return True
 
     def _send_with_retry(
-        self, channel: Channel, payload: Dict[str, Any]
+        self, channel: Channel, payload: Dict[str, Any], rule: AlertRule
     ) -> Tuple[bool, int, Optional[str]]:
-        """Deliver with the global retry policy; returns (sent, attempts, err)."""
+        """Deliver with the rule-level retry policy (rule > global default).
+
+        Returns ``(sent, attempts, error)``.  The rule's ``effective_retry``
+        resolves the total attempt count and inter-attempt delays; the
+        dedupe/cooldown pipeline is untouched (v0.5.0).
+        """
+        attempts, delays = rule.effective_retry(
+            self.retry_attempts, self.retry_delays
+        )
         try:
-            attempts = retry_with_backoff(
+            used = retry_with_backoff(
                 lambda: channel.send(payload),
-                attempts=self.retry_attempts,
-                delays=self.retry_delays,
+                attempts=attempts,
+                delays=delays,
                 sleep_fn=self.sleep_fn,
             )
-            return True, attempts, None
+            return True, used, None
         except ChannelError as exc:
-            return False, self.retry_attempts, str(exc)
+            return False, attempts, str(exc)
