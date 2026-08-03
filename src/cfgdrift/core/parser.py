@@ -263,6 +263,20 @@ def parse_text(text: str, fmt: str) -> dict:
     return _wrap_top_level(_normalize(data))
 
 
+def parse_text_lines(text: str, fmt: str) -> Tuple[dict, dict]:
+    """Parse text and build ``{key_path: line}`` for the same text.
+
+    Returns ``(tree, line_map)``.  The line map is produced by a lightweight
+    text scan (:mod:`cfgdrift.core.lines`) that is independent of the parsing
+    backend, so C and pure modes are consistent by construction.
+    """
+    from .lines import build_line_map
+
+    tree = parse_text(text, fmt)
+    line_map = build_line_map(text, fmt)
+    return tree, line_map
+
+
 def parse_file(path: str, fmt: str = "auto", warn: bool = True) -> Dict[str, Any]:
     """Read and parse a config file into a normalized semantic tree (dict).
 
@@ -285,3 +299,28 @@ def parse_file(path: str, fmt: str = "auto", warn: bool = True) -> Dict[str, Any
             file=sys.stderr,
         )
     return parse_text(text, fmt)
+
+
+def parse_file_lines(
+    path: str, fmt: str = "auto", warn: bool = True
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Read and parse a config file, returning ``(tree, line_map)``.
+
+    ``line_map`` maps semantic key paths to 1-based lines in the raw text
+    (see :func:`parse_text_lines`).  Errors follow :func:`parse_file`.
+    """
+    fmt = validate_format(fmt)
+    if fmt == "auto":
+        fmt = detect_format(path)
+        if fmt is None:
+            raise ValueError(
+                "cannot auto-detect format for %r (use --format json|yaml|toml|ini)"
+                % path
+            )
+    text, encoding = _read_text(path)
+    if warn and encoding != "utf-8":
+        print(
+            "warning: %s: decoded as %s (not strict UTF-8)" % (path, encoding),
+            file=sys.stderr,
+        )
+    return parse_text_lines(text, fmt)

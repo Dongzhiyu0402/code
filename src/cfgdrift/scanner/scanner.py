@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 import sys
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
 
-from ..core.parser import detect_format, parse_file, validate_format
+from ..core.parser import detect_format, parse_file, parse_file_lines, validate_format
 
 
 def _normalize_relpath(root: str, full_path: str) -> str:
@@ -78,6 +78,68 @@ class Scanner:
             except ValueError as exc:
                 raise ValueError("failed to parse %s: %s" % (relpath, exc)) from exc
         return snapshot
+
+    # -- line-map aware scanning (v0.4.0) --------------------------------
+
+    def scan_path_with_lines(
+        self, path: str, fmt: str = "auto"
+    ) -> Tuple[Dict[str, object], Dict[str, Dict[str, int]]]:
+        """Scan a file/directory and return ``(snapshot, line_maps)``.
+
+        ``line_maps`` maps each snapshot relpath to its ``{key_path: line}``
+        map (1-based lines in the raw text).  ``scan_path`` is unchanged; this
+        method is the v0.4.0 extension used by diff/compare/daemon.
+        """
+        fmt = validate_format(fmt)
+        path = os.path.abspath(path)
+        if os.path.isfile(path):
+            return self._scan_file_with_lines(path, fmt)
+        if os.path.isdir(path):
+            return self._scan_dir_with_lines(path, fmt)
+        raise ValueError("path does not exist: %s" % path)
+
+    def _scan_file_with_lines(
+        self, path: str, fmt: str
+    ) -> Tuple[Dict[str, object], Dict[str, Dict[str, int]]]:
+        use_fmt = fmt
+        if use_fmt == "auto":
+            detected = detect_format(path)
+            if detected is None:
+                raise ValueError(
+                    "cannot auto-detect format for %r (use --format "
+                    "json|yaml|toml|ini)" % path
+                )
+            use_fmt = detected
+        tree, line_map = parse_file_lines(path, fmt=use_fmt)
+        relpath = os.path.basename(path)
+        return {relpath: tree}, {relpath: line_map}
+
+    def _scan_dir_with_lines(
+        self, root: str, fmt: str
+    ) -> Tuple[Dict[str, object], Dict[str, Dict[str, int]]]:
+        snapshot: Dict[str, object] = {}
+        line_maps: Dict[str, Dict[str, int]] = {}
+        root_abs = os.path.abspath(root)
+        for full in _iter_files(root_abs):
+            detected = detect_format(full)
+            if fmt != "auto":
+                if detected is None or detected != fmt:
+                    continue
+            if detected is None:
+                print(
+                    "warning: skipping unknown extension: %s"
+                    % _normalize_relpath(root_abs, full),
+                    file=sys.stderr,
+                )
+                continue
+            relpath = _normalize_relpath(root_abs, full)
+            try:
+                tree, line_map = parse_file_lines(full, fmt=detected)
+            except ValueError as exc:
+                raise ValueError("failed to parse %s: %s" % (relpath, exc)) from exc
+            snapshot[relpath] = tree
+            line_maps[relpath] = line_map
+        return snapshot, line_maps
 
     def watch(
         self,

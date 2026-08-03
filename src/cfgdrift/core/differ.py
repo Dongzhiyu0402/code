@@ -10,6 +10,7 @@ from .model import (
     IgnoreRule,
     ScanSummary,
     Severity,
+    SeverityRule,
     join_path,
     type_name,
 )
@@ -44,27 +45,38 @@ class SemanticDiffer:
         new: dict,
         file: str = "",
         rules: Optional[List[IgnoreRule]] = None,
+        severity_rules: Optional[List[SeverityRule]] = None,
+        old_lines: Optional[Dict[str, Dict[str, int]]] = None,
+        new_lines: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> Tuple[List[DriftItem], ScanSummary]:
         """Diff two semantic trees for a single file.
 
         ``old`` / ``new`` are normalized trees.  ``file`` is the relpath used
-        in the resulting items.  Returns ``(items, summary)``.
+        in the resulting items.  ``severity_rules`` (v0.4.0) override the
+        built-in severity classification with first-match-wins before the
+        summary is computed; ``old_lines`` / ``new_lines`` attach 1-based
+        source lines to each item (new side preferred).  Returns
+        ``(items, summary)``.
         """
         items: List[DriftItem] = []
         self._diff_node(old, new, [], file, items)
-        return self._finalize(items, rules)
+        return self._finish(items, rules, severity_rules, old_lines, new_lines)
 
     def diff_snapshot(
         self,
         old_snapshot: dict,
         new_snapshot: dict,
         rules: Optional[List[IgnoreRule]] = None,
+        severity_rules: Optional[List[SeverityRule]] = None,
+        old_lines: Optional[Dict[str, Dict[str, int]]] = None,
+        new_lines: Optional[Dict[str, Dict[str, int]]] = None,
     ) -> Tuple[List[DriftItem], ScanSummary]:
         """Diff two snapshots ``{relpath: tree}``.
 
         Handles per-file key-level drift for files present in both snapshots
         and file-level drift (added/removed files) for files present in only
-        one snapshot.
+        one snapshot.  ``severity_rules`` / ``old_lines`` / ``new_lines`` are
+        the v0.4.0 extensions described in :meth:`diff`.
         """
         items: List[DriftItem] = []
         old_files = set(old_snapshot.keys())
@@ -100,7 +112,7 @@ class SemanticDiffer:
                     new_type="dict",
                 )
             )
-        return self._finalize(items, rules)
+        return self._finish(items, rules, severity_rules, old_lines, new_lines)
 
     # -- internals ---------------------------------------------------------
 
@@ -212,6 +224,61 @@ class SemanticDiffer:
                         new_type=new_t,
                     )
                 )
+
+    def _finish(
+        self,
+        items: List[DriftItem],
+        rules: Optional[List[IgnoreRule]],
+        severity_rules: Optional[List[SeverityRule]] = None,
+        old_lines: Optional[Dict[str, Dict[str, int]]] = None,
+        new_lines: Optional[Dict[str, Dict[str, int]]] = None,
+    ) -> Tuple[List[DriftItem], ScanSummary]:
+        """Post-process: severity override -> ignore filter -> lines -> summary.
+
+        The custom severity rules run *before* the ignore filter so that
+        ``summary.max_severity`` is computed over the overridden severities
+        (v0.4.0 decision: alert thresholds keep working with zero changes).
+        Line numbers are attached to the final kept items only.
+        """
+        self._apply_custom_severity(items, severity_rules)
+        kept, summary = self._finalize(items, rules)
+        self._attach_lines(kept, old_lines, new_lines)
+        return kept, summary
+
+    def _apply_custom_severity(
+        self,
+        items: List[DriftItem],
+        severity_rules: Optional[List[SeverityRule]],
+    ) -> None:
+        """Overwrite item severities with the first matching rule (file order)."""
+        if not severity_rules:
+            return
+        for item in items:
+            for rule in severity_rules:
+                if rule.matches(item):
+                    item.severity = rule.severity
+                    break  # first-match-wins
+
+    def _attach_lines(
+        self,
+        items: List[DriftItem],
+        old_lines: Optional[Dict[str, Dict[str, int]]],
+        new_lines: Optional[Dict[str, Dict[str, int]]],
+    ) -> None:
+        """Attach ``item.line`` from the new-side map, falling back to old."""
+        if not old_lines and not new_lines:
+            return
+        for item in items:
+            line = None
+            if new_lines:
+                file_map = new_lines.get(item.file)
+                if file_map and item.key_path in file_map:
+                    line = file_map[item.key_path]
+            if line is None and old_lines:
+                file_map = old_lines.get(item.file)
+                if file_map and item.key_path in file_map:
+                    line = file_map[item.key_path]
+            item.line = line
 
     def _finalize(
         self,

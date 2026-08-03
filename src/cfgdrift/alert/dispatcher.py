@@ -68,6 +68,8 @@ class AlertDispatcher:
         retry_delays: tuple = _DEFAULT_RETRY_DELAYS,
         sleep_fn: Callable[[float], None] = time.sleep,
         version: str = __version__,
+        event_sink=None,
+        masker=None,
     ) -> None:
         self.rules = list(rules)
         self.state = state
@@ -75,6 +77,13 @@ class AlertDispatcher:
         self.retry_delays = tuple(retry_delays)
         self.sleep_fn = sleep_fn
         self.version = version
+        # v0.4.0: optional alert-event sink (a Store instance).  Only
+        # sent/failed deliveries are recorded; cooldown-suppressed sends and
+        # connectivity tests never touch the sink.
+        self.event_sink = event_sink
+        # v0.4.0: optional masker applied to alert payloads (raw DB values
+        # are never changed).
+        self.masker = masker
 
     # -- public API -------------------------------------------------------
 
@@ -101,7 +110,7 @@ class AlertDispatcher:
                 )
                 continue
             payload = build_drift_payload(
-                report, baseline_name, target, self.version
+                report, baseline_name, target, self.version, masker=self.masker
             )
             meta = {
                 "rule": rule.name,
@@ -113,6 +122,16 @@ class AlertDispatcher:
                 channel = build_channel(rule)
             except ChannelError as exc:
                 self.state.record_failure(key, dict(meta, attempts=0))
+                self._record_event(
+                    baseline_name=baseline_name,
+                    report=report,
+                    rule=rule,
+                    fingerprint=fingerprint,
+                    target=target,
+                    status="failed",
+                    attempts=0,
+                    error=str(exc),
+                )
                 logger.error("alert %s channel build failed: %s", rule.name, exc)
                 results.append(
                     DispatchResult(
@@ -132,6 +151,16 @@ class AlertDispatcher:
                 self.state.record_success(
                     key, dict(meta, attempts=attempts)
                 )
+                self._record_event(
+                    baseline_name=baseline_name,
+                    report=report,
+                    rule=rule,
+                    fingerprint=fingerprint,
+                    target=target,
+                    status="sent",
+                    attempts=attempts,
+                    error=None,
+                )
                 logger.info(
                     "alert %s sent (attempts=%d) key=%s",
                     rule.name,
@@ -140,6 +169,16 @@ class AlertDispatcher:
                 )
             else:
                 self.state.record_failure(key, dict(meta, attempts=attempts))
+                self._record_event(
+                    baseline_name=baseline_name,
+                    report=report,
+                    rule=rule,
+                    fingerprint=fingerprint,
+                    target=target,
+                    status="failed",
+                    attempts=attempts,
+                    error=error,
+                )
                 logger.error(
                     "alert %s failed after %d attempt(s): %s",
                     rule.name,
@@ -193,6 +232,37 @@ class AlertDispatcher:
             )
 
     # -- internals --------------------------------------------------------
+
+    def _record_event(
+        self,
+        baseline_name: str,
+        report,
+        rule: AlertRule,
+        fingerprint: str,
+        target: str,
+        status: str,
+        attempts: int,
+        error: Optional[str],
+    ) -> None:
+        """Write a sent/failed alert event to the optional sink (v0.4.0)."""
+        if self.event_sink is None:
+            return
+        try:
+            self.event_sink.add_alert_event(
+                {
+                    "rule": rule.name,
+                    "baseline": baseline_name,
+                    "severity": report.summary.max_severity.value,
+                    "status": status,
+                    "target": target,
+                    "drift_count": report.summary.total,
+                    "error": error,
+                    "attempts": attempts,
+                    "fingerprint": fingerprint,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - events must not break alerts
+            logger.warning("failed to record alert event: %s", exc)
 
     def _rule_matches(
         self, rule: AlertRule, baseline_name: str, report

@@ -242,12 +242,15 @@ def build_drift_payload(
     baseline_name: str,
     target: str,
     version: str,
+    masker=None,
 ) -> Dict[str, Any]:
     """Build the v0.3.0 drift alert payload (B.1.3).
 
     ``report`` is a :class:`cfgdrift.core.model.Report`.  The payload contains
     only the drift summary and per-item diffs — never channel credentials,
-    full configuration content, or environment secrets.
+    full configuration content, or environment secrets.  ``masker`` (v0.4.0)
+    masks sensitive ``baseline`` / ``current`` values and marks the item with
+    ``masked: true``; the database keeps raw values.
     """
     severity = report.summary.max_severity
     items = []
@@ -260,10 +263,11 @@ def build_drift_payload(
                 "severity": item.severity.value,
                 "file": item.file,
                 "change_type": item.change_type.value,
+                "masked": bool(getattr(item, "masked", False)),
             }
         )
     count = len(items)
-    return {
+    payload: Dict[str, Any] = {
         "event": "cfgdrift.drift",
         "version": version,
         "timestamp": utcnow_iso(),
@@ -275,6 +279,9 @@ def build_drift_payload(
         "summary": "%d %s drift(s) in baseline %s"
         % (count, severity.value, baseline_name),
     }
+    if masker is not None:
+        masker.mask_payload(payload)
+    return payload
 
 
 def build_test_payload(version: str = "0.3.0") -> Dict[str, Any]:

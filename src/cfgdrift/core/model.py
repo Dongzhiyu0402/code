@@ -178,6 +178,12 @@ class DriftItem:
     old_type: Optional[str] = None
     new_type: Optional[str] = None
     rule_id: Optional[int] = None
+    # v0.4.0: 1-based source line of the key in the *new* file (falling back
+    # to the old file for REMOVED items); None when unavailable.
+    line: Optional[int] = None
+    # v0.4.0: True when a display exit masked the values (raw values stay in
+    # the database; masking is applied only at the four display exits).
+    masked: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -190,6 +196,8 @@ class DriftItem:
             "old_type": self.old_type,
             "new_type": self.new_type,
             "rule_id": self.rule_id,
+            "line": self.line,
+            "masked": self.masked,
         }
 
 
@@ -247,6 +255,9 @@ class Baseline:
     scan_root: str
     format: str
     data: dict = field(default_factory=dict)
+    # v0.4.0: optional ``{relpath: {key_path: line}}`` captured when the
+    # baseline was created (used for REMOVED-item line fallback).
+    line_maps: Optional[dict] = None
 
     def to_dict(self, include_data: bool = False) -> dict:
         out = {
@@ -260,6 +271,8 @@ class Baseline:
         }
         if include_data:
             out["data"] = self.data
+        if include_data and self.line_maps:
+            out["line_maps"] = self.line_maps
         return out
 
 
@@ -349,4 +362,127 @@ class IgnoreRule:
             "file_pattern": self.file_pattern,
             "change_type": self.change_type,
             "enabled": self.enabled,
+        }
+
+
+@dataclass
+class SeverityRule:
+    """A user-defined severity override rule (v0.4.0, severity.yaml).
+
+    Rules are applied *after* the built-in default classification with
+    first-match-wins (file order).  All pattern fields are optional regexes
+    matched against the corresponding item attribute; ``change_type`` matches
+    the change-type string (``added`` / ``removed`` / ``modified`` /
+    ``type_changed``).  ``value_pattern`` is matched against the JSON
+    serialization of either the old or the new value.
+    """
+
+    name: str
+    severity: Severity
+    change_type: Optional[str] = None
+    key_pattern: Optional[str] = None
+    value_pattern: Optional[str] = None
+    file_pattern: Optional[str] = None
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.name or not isinstance(self.name, str):
+            raise ValueError("severity rule name must be a non-empty string")
+        if not isinstance(self.severity, Severity):
+            self.severity = Severity(str(self.severity).upper())
+        if self.change_type is not None and not isinstance(self.change_type, str):
+            raise ValueError("severity rule %r change_type must be a string" % self.name)
+
+    def matches(self, item: DriftItem) -> bool:
+        """Return True when this rule applies to ``item`` (all set fields)."""
+        if not self.enabled:
+            return False
+        if self.change_type is not None and self.change_type != item.change_type.value:
+            return False
+        if self.key_pattern is not None:
+            try:
+                if re.search(self.key_pattern, item.key_path) is None:
+                    return False
+            except re.error:
+                return False
+        if self.value_pattern is not None:
+            if not self._value_matches(item):
+                return False
+        if self.file_pattern is not None:
+            try:
+                if re.search(self.file_pattern, item.file or "") is None:
+                    return False
+            except re.error:
+                return False
+        return True
+
+    def _value_matches(self, item: DriftItem) -> bool:
+        candidates = []
+        if item.old_value is not None:
+            candidates.append(json.dumps(to_jsonable(item.old_value), ensure_ascii=False))
+        if item.new_value is not None:
+            candidates.append(json.dumps(to_jsonable(item.new_value), ensure_ascii=False))
+        try:
+            return any(re.search(self.value_pattern, c) for c in candidates)
+        except re.error:
+            return False
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "severity": self.severity.value,
+            "change_type": self.change_type,
+            "key_pattern": self.key_pattern,
+            "value_pattern": self.value_pattern,
+            "file_pattern": self.file_pattern,
+            "enabled": self.enabled,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SeverityRule":
+        """Build a validated rule from a raw ``severity.yaml`` entry."""
+        name = data.get("name")
+        if not name or not isinstance(name, str):
+            raise ValueError("severity rule is missing a non-empty 'name'")
+        try:
+            severity = Severity(str(data.get("severity", "WARN")).upper())
+        except ValueError:
+            raise ValueError(
+                "severity rule %r has invalid severity %r"
+                % (name, data.get("severity"))
+            ) from None
+        return cls(
+            name=name,
+            severity=severity,
+            change_type=data.get("change_type"),
+            key_pattern=data.get("key_pattern"),
+            value_pattern=data.get("value_pattern"),
+            file_pattern=data.get("file_pattern"),
+            enabled=bool(data.get("enabled", True)),
+        )
+
+
+@dataclass
+class CompareReport:
+    """Result of comparing one environment's baseline against a reference."""
+
+    baseline_a: str  # reference environment/baseline
+    baseline_b: str  # compared environment/baseline
+    created_at: str
+    summary: ScanSummary
+    items: List[DriftItem] = field(default_factory=list)
+    # v0.4.0: baseline versions of the two compared environments (displayed
+    # by the CLI header and exported by --json; design 4.1).
+    env1_version: Optional[int] = None
+    env2_version: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "baseline_a": self.baseline_a,
+            "baseline_b": self.baseline_b,
+            "created_at": self.created_at,
+            "env1_version": self.env1_version,
+            "env2_version": self.env2_version,
+            "summary": self.summary.to_dict(),
+            "items": [item.to_dict() for item in self.items],
         }

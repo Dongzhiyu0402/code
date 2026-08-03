@@ -39,7 +39,22 @@ def _fmt_type(value) -> str:
 class Reporter:
     """Renders :class:`Report` objects for terminal / JSON output."""
 
-    def render_terminal(self, report: Report, color: bool = True) -> str:
+    def render_terminal(
+        self,
+        report: Report,
+        color: bool = True,
+        masker=None,
+        show_line: bool = True,
+    ) -> str:
+        """Render a report as colored/plain terminal text.
+
+        ``masker`` (v0.4.0) masks sensitive values in place before rendering;
+        ``show_line`` (v0.4.0) appends ``file:line`` to the location when a
+        line number is available (``--no-line`` disables it).
+        """
+        if masker is not None:
+            for item in report.items:
+                masker.mask_item(item)
         lines: list[str] = []
         for item in report.items:
             sev = item.severity
@@ -50,6 +65,9 @@ class Reporter:
             where = item.key_path if item.key_path else "(file)"
             old = _fmt_value(item.old_value)
             new = _fmt_value(item.new_value)
+            location = item.file
+            if show_line and item.line is not None:
+                location = "%s:%d" % (item.file, item.line)
             if item.change_type == ChangeType.TYPE_CHANGED:
                 detail = "类型变化 (%s -> %s)" % (
                     _fmt_type(item.old_type),
@@ -57,15 +75,15 @@ class Reporter:
                 )
                 lines.append(
                     "%s %s (%s): %s %s -> %s"
-                    % (tag, where, item.file, label, old, new)
+                    % (tag, where, location, label, old, new)
                 )
                 lines.append(
-                    "%s %s (%s): %s" % (tag, where, item.file, detail)
+                    "%s %s (%s): %s" % (tag, where, location, detail)
                 )
             else:
                 lines.append(
                     "%s %s (%s): %s %s -> %s"
-                    % (tag, where, item.file, label, old, new)
+                    % (tag, where, location, label, old, new)
                 )
 
         s = report.summary
@@ -84,10 +102,21 @@ class Reporter:
         )
         return "\n".join(lines)
 
-    def render_json(self, report: Report) -> str:
-        """Render the full 7.6 report JSON document."""
+    def render_json(
+        self,
+        report: Report,
+        masker=None,
+    ) -> str:
+        """Render the full 7.6 report JSON document.
+
+        ``masker`` (v0.4.0) masks sensitive values in the serialized items
+        (raw values stay in the database).
+        """
+        data = report.to_dict()
+        if masker is not None:
+            masker.mask_payload({"data": data})
         return json.dumps(
-            {"code": 0, "data": report.to_dict(), "message": "ok"},
+            {"code": 0, "data": data, "message": "ok"},
             ensure_ascii=False,
             indent=2,
         )

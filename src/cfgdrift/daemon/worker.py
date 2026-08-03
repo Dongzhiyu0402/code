@@ -28,7 +28,9 @@ from ..alert.config import AlertConfig
 from ..alert.dispatcher import AlertDispatcher
 from ..alert.state import AlertStateStore
 from ..core.differ import SemanticDiffer
+from ..core.masker import SensitiveMasker, masking_config_path
 from ..core.model import Report, ScanSummary
+from ..rules.severity import SeverityConfig, default_path as severity_config_path
 from ..scanner.scanner import Scanner
 from ..storage.store import Store, utcnow_iso
 
@@ -107,6 +109,8 @@ class DaemonWorker:
         info_file: Optional[str] = None,
         log_file: Optional[str] = None,
         log: Optional[logging.Logger] = None,
+        masker: Optional[SensitiveMasker] = None,
+        severity_rules: Optional[List[Any]] = None,
     ) -> None:
         self.store_path = os.path.abspath(store_path)
         self.paths = [os.path.abspath(p) for p in paths]
@@ -119,6 +123,8 @@ class DaemonWorker:
         self.info_file = info_file
         self.log_file = log_file
         self.log = log or logger
+        self.masker = masker
+        self.severity_rules = list(severity_rules or [])
         self._stop_event = threading.Event()
         self._scanner = Scanner()
         self._differ = SemanticDiffer()
@@ -144,6 +150,14 @@ class DaemonWorker:
                 self._notify_readiness(readiness_fd, ok=False, err=str(exc))
             self._clear_pid_file()
             return 2
+
+        # v0.4.0: wire the alert-event sink + masker into the dispatcher
+        # (the dispatcher is built before the Store exists, so the sink is
+        # assigned here as a property).
+        if self.dispatcher is not None:
+            self.dispatcher.event_sink = store
+            if self.dispatcher.masker is None:
+                self.dispatcher.masker = self.masker
 
         self._write_info_file()
         if readiness_fd is not None:
@@ -179,11 +193,16 @@ class DaemonWorker:
 
     def _scan_one(self, store: Store, path: str) -> None:
         """Scan one target path, diff, persist, and dispatch alerts."""
-        snapshot = self._scanner.scan_path(path, self.fmt)
+        snapshot, line_maps = self._scanner.scan_path_with_lines(path, self.fmt)
         baseline = store.get_baseline(self.baseline_name)
         rules = store.list_rules(baseline.id)
         items, summary = self._differ.diff_snapshot(
-            baseline.data, snapshot, rules
+            baseline.data,
+            snapshot,
+            rules,
+            severity_rules=self.severity_rules,
+            old_lines=baseline.line_maps,
+            new_lines=line_maps,
         )
         report = Report(
             scan_id=None,
@@ -356,6 +375,29 @@ def _build_dispatcher(opts: Dict[str, Any]) -> Optional[AlertDispatcher]:
     return AlertDispatcher(rules, state)
 
 
+def _load_masker(opts: Dict[str, Any]) -> SensitiveMasker:
+    """Load masking.yaml (missing/corrupt -> default masker).
+
+    Always returns a masker so alert payloads are masked by default at the
+    alert display exit (the database keeps raw values).
+    """
+    home = opts.get("home")
+    if not home:
+        return SensitiveMasker()
+    return SensitiveMasker.from_config(masking_config_path(home))
+
+
+def _load_severity_rules(opts: Dict[str, Any]) -> List[Any]:
+    """Load severity.yaml rules (empty list when absent; corrupt raises)."""
+    home = opts.get("home")
+    if not home:
+        return []
+    path = severity_config_path(home)
+    if not os.path.exists(path):
+        return []
+    return SeverityConfig.load(path)
+
+
 def run_with_opts(opts: Dict[str, Any]) -> int:
     """Build logging + worker from a resolved options dict and run."""
     log = setup_logging(
@@ -369,6 +411,13 @@ def run_with_opts(opts: Dict[str, Any]) -> int:
             "alert dispatcher ready (%d rule(s))",
             len(dispatcher.rules),
         )
+    masker = _load_masker(opts)
+    if masker is not None:
+        log.info("sensitive-value masker ready (keywords=%d patterns=%d)",
+                 len(masker.keywords), len(masker.patterns))
+    severity_rules = _load_severity_rules(opts)
+    if severity_rules:
+        log.info("custom severity rules loaded (%d rule(s))", len(severity_rules))
     paths = opts.get("paths") or opts.get("targets") or []
     worker = DaemonWorker(
         store_path=opts["store"],
@@ -382,6 +431,8 @@ def run_with_opts(opts: Dict[str, Any]) -> int:
         info_file=opts.get("info_file"),
         log_file=opts.get("log_file"),
         log=log,
+        masker=masker,
+        severity_rules=severity_rules,
     )
     # POSIX daemonize passes a readiness fd; Windows/foreground do not.
     readiness_fd = opts.get("readiness_fd")
@@ -423,6 +474,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     home = args.home or default_home()
     opts: Dict[str, Any] = {
+        "home": home,
         "store": args.store or os.path.join(home, "cfgdrift.db"),
         "paths": list(args.paths),
         "baseline": args.baseline,

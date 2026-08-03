@@ -113,6 +113,23 @@
   .bar-num { width: 40px; text-align: right; font-size: 13px; }
   #timeline .scan-item { display: flex; justify-content: space-between; align-items: center; }
   #severitySvg { width: 100%; max-width: 420px; height: auto; }
+  /* v0.4.0: line-snippet modal + masked badge + alert views */
+  .masked-badge { display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 10px; background: rgba(56,189,248,.15); color: var(--accent); margin-left: 4px; }
+  .line-link { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  .line-link:hover { color: #7dd3fc; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; max-width: 720px; width: 92%; max-height: 80vh; display: flex; flex-direction: column; }
+  .modal-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .modal-head h3 { font-size: 15px; }
+  .modal-close { background: transparent; border: none; color: var(--muted); font-size: 18px; cursor: pointer; }
+  .modal-body { padding: 12px 16px; overflow: auto; font-family: Consolas, "Courier New", monospace; font-size: 12px; line-height: 1.7; }
+  .modal-body pre { margin: 0; white-space: pre; }
+  .src-line { display: inline-block; width: 42px; color: var(--muted); user-select: none; }
+  .src-line.hl { background: rgba(245,158,11,.25); color: var(--warn); font-weight: 700; }
+  .event-error { color: var(--critical); font-size: 12px; word-break: break-all; }
+  .pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 13px; }
+  .pager button { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 4px 12px; border-radius: 8px; cursor: pointer; }
+  .pager button:disabled { opacity: .4; cursor: default; }
 </style>
 </head>
 <body>
@@ -124,6 +141,7 @@
   <button data-view="reports">报告浏览</button>
   <button data-view="baselines">基线管理</button>
   <button data-view="rules">忽略规则</button>
+  <button data-view="alerts">告警管理</button>
 </nav>
 <main>
   <section id="view-overview"></section>
@@ -132,6 +150,7 @@
   <section id="view-reports" class="hidden"></section>
   <section id="view-baselines" class="hidden"></section>
   <section id="view-rules" class="hidden"></section>
+  <section id="view-alerts" class="hidden"></section>
 </main>
 <script src="/app.js"></script>
 </body>

@@ -43,3 +43,13 @@ _webtest/
 demo_home/
 .venv_check/
 .qa_verify/
+
+# 调试/临时产物
+.regression_*.txt
+.web_retest*.txt
+.diag*.txt
+_pytest_final.txt
+_qa_*.txt
+_qa_r5*.txt
+_qa_py38_*/
+_qa_wheel_*/

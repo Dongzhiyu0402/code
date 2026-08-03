@@ -158,6 +158,31 @@ class DaemonManager:
     # status
     # ------------------------------------------------------------------
 
+    def status_dict(self) -> Dict[str, Any]:
+        """Return daemon status as a dict without printing (v0.4.0, Web API).
+
+        Structure: ``{"running": bool, "pid": int|None, "stale": bool,
+        "info": dict|None, "error": str|None}``.  A corrupt PID file yields
+        ``{"running": False, "error": "..."}``; a stale PID file is cleared
+        and reported with ``stale=True``.
+        """
+        try:
+            pid = self._read_pid()
+        except ValueError as exc:
+            return {"running": False, "pid": None, "stale": False, "info": None,
+                    "error": str(exc)}
+        if pid is None:
+            return {"running": False, "pid": None, "stale": False, "info": None,
+                    "error": None}
+        if self._process_exists(pid):
+            info = self.read_info()
+            return {"running": True, "pid": pid, "stale": False, "info": info,
+                    "error": None}
+        self._clear_pid()
+        self._clear_info()
+        return {"running": False, "pid": None, "stale": True, "info": None,
+                "error": None}
+
     def status(self) -> int:
         """Print daemon status; returns 0 running / 1 stopped / 2 error."""
         try:
@@ -225,6 +250,7 @@ class DaemonManager:
         opts["targets"] = targets
         opts["baseline"] = baseline_name
         opts["store"] = store_path
+        opts.setdefault("home", self.home)
 
         if sys.platform == "win32":
             return self._spawn_worker_win32(opts)

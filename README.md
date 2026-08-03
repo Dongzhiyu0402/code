@@ -17,16 +17,20 @@
 - `cfgdrift init`：初始化数据库（默认 `~/.cfgdrift/cfgdrift.db`）
 - `cfgdrift scan`：扫描单文件或目录，记录历史 / 保存基线 / `--watch` 轮询
 - `cfgdrift baseline create|list|show|rollback`：基线版本化管理
-- `cfgdrift diff --baseline NAME`：与基线比对，输出漂移报告
+- `cfgdrift diff --baseline NAME`：与基线比对，输出漂移报告（含 `file:line` 行号，`--no-line` 可关闭）
+- `cfgdrift compare ENV1 ENV2...`：多环境基线对比，头部展示双方基线版本 `compare A -> B (vX vs vY)`，支持 `environments.yaml` 映射与 `--json`
+- `cfgdrift severity add|list|remove|enable|disable`：自定义严重度覆盖规则（`severity.yaml`，非法正则报错 exit 2）
 - `cfgdrift report --json out.json`：导出 JSON 报告
 - `cfgdrift ignore add|list|remove`：忽略规则（exact / prefix / regex）
 - `cfgdrift serve`：启动本地 Web 仪表盘（`127.0.0.1:8080`，需 `[web]` extra）
+- **敏感值脱敏**：终端 / JSON 报告 / Web API / 告警 payload 四个显示出口对 `password` / `token` / `secret` 等 13 类敏感键自动打码（`masking.yaml` 可定制，数据库始终保存原始值）
+- **行号定位**：diff / compare 输出标明 `file:line`，便于快速定位漂移源
 
 退出码：`0`=无漂移，`1`=检出漂移，`2`=错误。
 
 ## 安装
 
-自 v0.2.0 起（当前版本 v0.3.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
+自 v0.2.0 起（当前版本 v0.4.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
 的通用包：C 扩展是可选加速器，未编译或安装失败时自动降级到纯 Python 解析器。
 
 ```bash
@@ -39,9 +43,9 @@ pip install "cfgdrift[dev]"     # 含测试依赖
 
 | 发布件 | 适用用户 | 说明 |
 |--------|----------|------|
-| `cfgdrift-0.3.0-py3-none-any.whl` | 所有 Python 3.8+ | 纯 Python 通用 wheel（默认主发布件） |
-| `cfgdrift-0.3.0-cp313-*-*.whl` | CPython 3.13 | 可选 C 加速平台 wheel（更快的 JSON/TOML/INI 解析） |
-| `cfgdrift-0.3.0.tar.gz`（sdist） | 需要本地编译 | 携带 C 源码，`pip install` 时尝试编译，失败自动降级 |
+| `cfgdrift-0.4.0-py3-none-any.whl` | 所有 Python 3.8+ | 纯 Python 通用 wheel（默认主发布件） |
+| `cfgdrift-0.4.0-cp313-*-*.whl` | CPython 3.13 | 可选 C 加速平台 wheel（更快的 JSON/TOML/INI 解析） |
+| `cfgdrift-0.4.0.tar.gz`（sdist） | 需要本地编译 | 携带 C 源码，`pip install` 时尝试编译，失败自动降级 |
 
 pip 的标签优先级天然让 CPython 3.13 用户拿到加速件、其他版本拿到通用件。
 

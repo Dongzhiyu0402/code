@@ -173,9 +173,9 @@ class TestBackendEnvironment:
     def test_version_strings(self):
         import cfgdrift
 
-        assert cfgdrift.__version__ == "0.3.0"
+        assert cfgdrift.__version__ == "0.4.0"
         if HAVE_C:
-            assert _cfgdrift.version() == "0.3.0-c"
+            assert _cfgdrift.version() == "0.4.0-c"
 
     def test_set_backend_runtime_switch_roundtrip(self):
         original = parser_mod.PARSER_BACKEND

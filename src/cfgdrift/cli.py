@@ -19,13 +19,17 @@ from .alert.config import AlertConfig
 from .alert.dispatcher import AlertDispatcher
 from .alert.models import AlertRule
 from .alert.state import AlertStateStore
+from .core.compare import CompareEngine
 from .core.differ import SemanticDiffer
+from .core.masker import SensitiveMasker, masking_config_path
 from .core.model import IgnoreRule, Report, ScanSummary, Severity
 from .core.parser import parse_file
 from .core.reporter import Reporter
 from .daemon.daemon import DaemonManager
 from .daemon.worker import main as worker_main
 from .rules.ignore import make_rule
+from .rules.severity import SeverityConfig, default_path as severity_config_path
+from .rules.severity import make_rule as make_severity_rule
 from .scanner.scanner import Scanner
 from .storage.store import Store, utcnow_iso
 
@@ -63,6 +67,26 @@ def _echo_json(payload: Dict[str, Any]) -> None:
 
 def _report_payload(report: Report) -> Dict[str, Any]:
     return {"code": 0, "data": report.to_dict(), "message": "ok"}
+
+
+def _build_masker(extra_keywords: Optional[List[str]] = None) -> SensitiveMasker:
+    """Build the display masker from masking.yaml + --sensitive-keys (append).
+
+    Always returns a masker: masking.yaml is optional (defaults apply), and
+    the four display exits (terminal / JSON / Web API / alert payload) mask by
+    default while the database keeps raw values.
+    """
+    return SensitiveMasker.from_config(
+        masking_config_path(_daemon_home()), extra_keywords=extra_keywords
+    )
+
+
+def _load_severity_rules() -> List[Any]:
+    """Load custom severity rules from severity.yaml (empty when absent)."""
+    path = severity_config_path(_daemon_home())
+    if not os.path.exists(path):
+        return []
+    return SeverityConfig.load(path)
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +136,11 @@ def _perform_scan(
     save_as_baseline: Optional[str],
     mode: str,
     description: str = "",
+    no_line: bool = False,
+    masker: Optional[SensitiveMasker] = None,
 ) -> int:
     store = _open_store(ctx)
-    snapshot = _SCANNER.scan_path(path, fmt)
+    snapshot, line_maps = _SCANNER.scan_path_with_lines(path, fmt)
 
     baseline = None
     baseline_id = None
@@ -129,6 +155,7 @@ def _perform_scan(
             scan_root=os.path.abspath(path),
             format=fmt,
             data=snapshot,
+            line_maps=line_maps,
         )
         baseline_id = baseline.id
 
@@ -136,7 +163,15 @@ def _perform_scan(
     summary = ScanSummary()
     if baseline is not None:
         rules = store.list_rules(baseline_id)
-        items, summary = _DIFFER.diff_snapshot(baseline.data, snapshot, rules)
+        severity_rules = _load_severity_rules()
+        items, summary = _DIFFER.diff_snapshot(
+            baseline.data,
+            snapshot,
+            rules,
+            severity_rules=severity_rules,
+            old_lines=baseline.line_maps,
+            new_lines=line_maps,
+        )
 
     report = Report(
         scan_id=None,
@@ -155,7 +190,14 @@ def _perform_scan(
         click.echo("recorded scan #%d (no baseline comparison)" % scan_id)
         return 0
 
-    click.echo(_REPORTER.render_terminal(report, color=_use_color(ctx)))
+    click.echo(
+        _REPORTER.render_terminal(
+            report,
+            color=_use_color(ctx),
+            masker=masker,
+            show_line=not no_line,
+        )
+    )
     if summary.total > 0:
         return 1
     return 0
@@ -184,6 +226,13 @@ def _use_color(ctx: click.Context) -> bool:
 @click.option("--watch", is_flag=True, help="Watch the path and re-scan periodically.")
 @click.option("--interval", default=60, type=int, help="Watch interval in seconds.")
 @click.option("--description", default="", help="Description for --save-as-baseline.")
+@click.option(
+    "--sensitive-keys",
+    "sensitive_keys",
+    multiple=True,
+    help="Extra sensitive key stems to mask (append; default list is always active).",
+)
+@click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
 @click.pass_context
 def scan(
     ctx: click.Context,
@@ -194,10 +243,13 @@ def scan(
     watch: bool,
     interval: int,
     description: str,
+    sensitive_keys: tuple,
+    no_line: bool,
 ) -> int:
     """Scan a file or directory and (optionally) compare against a baseline."""
     if interval <= 0:
         raise ValueError("--interval must be a positive integer")
+    masker = _build_masker(list(sensitive_keys))
 
     def on_scan(snapshot: Dict[str, object]) -> None:
         _perform_scan(
@@ -208,6 +260,8 @@ def scan(
             save_as_baseline,
             mode="watch",
             description=description,
+            no_line=no_line,
+            masker=masker,
         )
 
     if watch:
@@ -218,7 +272,7 @@ def scan(
         return 0
     return _perform_scan(
         ctx, path, fmt, baseline_name, save_as_baseline, mode="manual",
-        description=description,
+        description=description, no_line=no_line, masker=masker,
     )
 
 
@@ -243,13 +297,14 @@ def baseline_create(ctx: click.Context, name: str, scan_root: str, fmt: str,
                     description: str) -> int:
     """Create a new baseline version from a file/directory snapshot."""
     store = _open_store(ctx)
-    snapshot = _SCANNER.scan_path(scan_root, fmt)
+    snapshot, line_maps = _SCANNER.scan_path_with_lines(scan_root, fmt)
     bl = store.create_baseline(
         name=name,
         description=description,
         scan_root=os.path.abspath(scan_root),
         format=fmt,
         data=snapshot,
+        line_maps=line_maps,
     )
     store.close()
     click.echo("baseline %r version %d created" % (bl.name, bl.version))
@@ -309,18 +364,167 @@ def baseline_rollback(ctx: click.Context, name: str) -> int:
 # diff
 # ---------------------------------------------------------------------------
 
+def _run_compare(
+    ctx: click.Context,
+    environments: List[str],
+    no_line: bool = False,
+    json_output: bool = False,
+    severity_filter: Optional[str] = None,
+) -> int:
+    """Shared compare logic used by ``compare`` and ``diff --compare``."""
+    store = _open_store(ctx)
+    engine = CompareEngine(store)
+    env_map = engine.load_environments(_daemon_home())
+    severity_rules = _load_severity_rules()
+    # compare is a display exit: mask sensitive values (masking.yaml + defaults)
+    # so password-like keys never leak plaintext in terminal/JSON output.
+    masker = _build_masker()
+    try:
+        reports = engine.compare(
+            list(environments),
+            env_map=env_map,
+            severity_rules=severity_rules,
+            masker=masker,
+        )
+    except ValueError as exc:
+        store.close()
+        raise ValueError(str(exc)) from exc
+    store.close()
+
+    any_drift = any(rep.summary.total > 0 for rep in reports)
+
+    if json_output:
+        payload = {
+            "code": 0,
+            "data": [rep.to_dict() for rep in reports],
+            "message": "ok",
+        }
+        _echo_json(payload)
+        return 1 if any_drift else 0
+
+    for rep in reports:
+        version_a = rep.env1_version if rep.env1_version is not None else "?"
+        version_b = rep.env2_version if rep.env2_version is not None else "?"
+        click.echo(
+            "compare %s -> %s (v%s vs v%s)"
+            % (rep.baseline_a, rep.baseline_b, version_a, version_b)
+        )
+        items = rep.items
+        if severity_filter:
+            min_rank = Severity(severity_filter).rank
+            items = [it for it in items if it.severity.rank >= min_rank]
+        if not items:
+            click.echo("  no differences")
+            continue
+        for it in items:
+            sev = it.severity.value
+            where = it.key_path if it.key_path else "(file)"
+            location = it.file
+            if not no_line and it.line is not None:
+                location = "%s:%d" % (it.file, it.line)
+            click.echo(
+                "  [%s] %s (%s): %s %s -> %s"
+                % (
+                    sev,
+                    where,
+                    location,
+                    it.change_type.value,
+                    json.dumps(it.old_value, ensure_ascii=False)
+                    if it.old_value is not None
+                    else "null",
+                    json.dumps(it.new_value, ensure_ascii=False)
+                    if it.new_value is not None
+                    else "null",
+                )
+            )
+        s = rep.summary
+        click.echo(
+            "  Summary: added=%d removed=%d modified=%d type_changed=%d "
+            "ignored=%d total=%d max=%s"
+            % (
+                s.added,
+                s.removed,
+                s.modified,
+                s.type_changed,
+                s.ignored,
+                s.total,
+                s.max_severity.value,
+            )
+        )
+    return 1 if any_drift else 0
+
+
 @cli.command()
-@click.argument("path", type=click.Path(exists=True))
-@click.option("--baseline", "baseline_name", required=True, help="Baseline name (required).")
+@click.argument("path", type=click.Path(exists=True), required=False)
+@click.option("--baseline", "baseline_name", default=None,
+              help="Baseline name (required unless --compare).")
 @click.option("--format", "fmt", default="auto",
               type=click.Choice(["auto", "json", "yaml", "toml", "ini"]))
 @click.option("--color/--no-color", default=True, help="Colored terminal output.")
+@click.option("--compare", "compare_mode", is_flag=True,
+              help="Compare two baselines by environment name (--env1/--env2).")
+@click.option("--env1", default=None, help="Reference environment name (with --compare).")
+@click.option("--env2", default=None, help="Compared environment name (with --compare).")
+@click.option(
+    "--sensitive-keys",
+    "sensitive_keys",
+    multiple=True,
+    help="Extra sensitive key stems to mask (append; default list is always active).",
+)
+@click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
 @click.pass_context
-def diff(ctx: click.Context, path: str, baseline_name: str, fmt: str,
-         color: bool) -> int:
-    """Diff a file/directory against a baseline and print the drift report."""
+def diff(ctx: click.Context, path: Optional[str], baseline_name: Optional[str],
+         fmt: str, color: bool, compare_mode: bool, env1: Optional[str],
+         env2: Optional[str], sensitive_keys: tuple, no_line: bool) -> int:
+    """Diff a file/directory against a baseline and print the drift report.
+
+    ``--compare`` is a v0.4.0 alias for ``cfgdrift compare ENV1 ENV2``.
+    """
     ctx.obj["color"] = color
-    return _perform_scan(ctx, path, fmt, baseline_name, None, mode="manual")
+    if compare_mode:
+        if not env1 or not env2:
+            raise ValueError("--compare requires --env1 and --env2")
+        return _run_compare(ctx, [env1, env2], no_line=no_line)
+    if not baseline_name:
+        raise ValueError("--baseline is required (or use --compare)")
+    if not path:
+        raise ValueError("path is required (unless --compare)")
+    masker = _build_masker(list(sensitive_keys))
+    return _perform_scan(
+        ctx, path, fmt, baseline_name, None, mode="manual",
+        no_line=no_line, masker=masker,
+    )
+
+
+# ---------------------------------------------------------------------------
+# compare (v0.4.0)
+# ---------------------------------------------------------------------------
+
+@cli.command("compare")
+@click.argument("environments", nargs=-1, required=True)
+@click.option("--severity", "severity_filter", default=None,
+              type=click.Choice(["CRITICAL", "WARN", "INFO", "NONE"]),
+              help="Only show items at or above this severity.")
+@click.option("--json", "json_output", is_flag=True, help="Output JSON.")
+@click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
+@click.option("-v", "verbose", is_flag=True, help="Verbose output (accepted for parity).")
+@click.pass_context
+def compare(ctx: click.Context, environments: tuple, severity_filter: Optional[str],
+            json_output: bool, no_line: bool, verbose: bool) -> int:
+    """Compare multiple environments' baselines against the first one.
+
+    ``ENV1`` is the reference; every other environment is diffed against it.
+    Environment names resolve to baselines through environments.yaml (when
+    present); absent mappings use the environment name as the baseline name.
+    Exit codes: 0 = no differences, 1 = differences, 2 = error.
+    """
+    return _run_compare(
+        ctx,
+        list(environments),
+        no_line=no_line,
+        json_output=json_output,
+        severity_filter=severity_filter,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +537,10 @@ def diff(ctx: click.Context, path: str, baseline_name: str, fmt: str,
 @click.option("--json", "json_path", type=click.Path(), default=None,
               help="Write the JSON report to a file.")
 @click.option("--color/--no-color", default=True, help="Colored terminal output.")
+@click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
 @click.pass_context
 def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
-           color: bool) -> int:
+           color: bool, no_line: bool) -> int:
     """Render a stored scan report (terminal or JSON)."""
     store = _open_store(ctx)
     if scan_id is None:
@@ -362,7 +567,6 @@ def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
     summary.max_severity = summary_data.get("max_severity", "NONE")
 
     # Rebuild a lightweight Report for terminal rendering.
-    baseline_ref = data.get("baseline")
     items = [_item_from_dict(i) for i in data.get("items", [])]
     rep = Report(
         scan_id=scan_id,
@@ -374,11 +578,15 @@ def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
     )
 
     if json_path:
+        masker = _build_masker()
+        masker.mask_payload(payload)
         with open(json_path, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=2)
         click.echo("report written to %s" % json_path)
         return 0
-    click.echo(_REPORTER.render_terminal(rep, color=color))
+    masker = _build_masker()
+    click.echo(_REPORTER.render_terminal(rep, color=color, masker=masker,
+                                         show_line=not no_line))
     return 1 if summary.total > 0 else 0
 
 
@@ -395,6 +603,8 @@ def _item_from_dict(d: Dict[str, Any]):
         old_type=d.get("old_type"),
         new_type=d.get("new_type"),
         rule_id=d.get("rule_id"),
+        line=d.get("line"),
+        masked=bool(d.get("masked", False)),
     )
 
 
@@ -486,6 +696,112 @@ def ignore_remove(ctx: click.Context, rule_id: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# severity group (v0.4.0)
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def severity() -> None:
+    """Manage custom severity override rules (severity.yaml)."""
+
+
+@severity.command("add")
+@click.option("--name", required=True, help="Unique rule name.")
+@click.option("--severity", "sev", required=True,
+              type=click.Choice(["CRITICAL", "WARN", "INFO", "NONE"]))
+@click.option("--change-type", "change_type", default=None,
+              type=click.Choice(["added", "removed", "modified", "type_changed"]))
+@click.option("--key-pattern", "key_pattern", default=None,
+              help="Regex matched against the item key_path (optional).")
+@click.option("--value-pattern", "value_pattern", default=None,
+              help="Regex matched against old/new values (optional).")
+@click.option("--file-pattern", "file_pattern", default=None,
+              help="Regex matched against the file relpath (optional).")
+@click.option("--disable", "disable", is_flag=True,
+              help="Create the rule disabled (default: enabled).")
+@click.pass_context
+def severity_add(ctx: click.Context, name: str, sev: str,
+                 change_type: Optional[str], key_pattern: Optional[str],
+                 value_pattern: Optional[str], file_pattern: Optional[str],
+                 disable: bool) -> int:
+    """Add a severity override rule (first-match-wins, file order)."""
+    path = severity_config_path(_daemon_home())
+    rule = make_severity_rule(
+        name=name,
+        severity=sev,
+        change_type=change_type,
+        key_pattern=key_pattern,
+        value_pattern=value_pattern,
+        file_pattern=file_pattern,
+        enabled=not disable,
+    )
+    SeverityConfig.add_rule(path, rule)
+    click.echo(
+        "severity rule %r added (severity=%s%s)" % (
+            name, sev, "" if not disable else ", disabled")
+    )
+    return 0
+
+
+@severity.command("list")
+@click.pass_context
+def severity_list(ctx: click.Context) -> int:
+    """List severity override rules (source=severity.yaml)."""
+    path = severity_config_path(_daemon_home())
+    rules = SeverityConfig.list_rules(path)
+    if not rules:
+        click.echo("no severity rules")
+        return 0
+    for r in rules:
+        click.echo(
+            "# %s severity=%s enabled=%s change=%s key=%s value=%s file=%s "
+            "source=severity.yaml"
+            % (
+                r.name,
+                r.severity.value,
+                "yes" if r.enabled else "no",
+                r.change_type or "-",
+                r.key_pattern or "-",
+                r.value_pattern or "-",
+                r.file_pattern or "-",
+            )
+        )
+    return 0
+
+
+@severity.command("remove")
+@click.argument("name")
+@click.pass_context
+def severity_remove(ctx: click.Context, name: str) -> int:
+    """Remove a severity rule by name."""
+    path = severity_config_path(_daemon_home())
+    SeverityConfig.remove_rule(path, name)
+    click.echo("severity rule %r removed" % name)
+    return 0
+
+
+@severity.command("enable")
+@click.argument("name")
+@click.pass_context
+def severity_enable(ctx: click.Context, name: str) -> int:
+    """Enable a severity rule by name."""
+    path = severity_config_path(_daemon_home())
+    SeverityConfig.set_enabled(path, name, True)
+    click.echo("severity rule %r enabled" % name)
+    return 0
+
+
+@severity.command("disable")
+@click.argument("name")
+@click.pass_context
+def severity_disable(ctx: click.Context, name: str) -> int:
+    """Disable a severity rule by name."""
+    path = severity_config_path(_daemon_home())
+    SeverityConfig.set_enabled(path, name, False)
+    click.echo("severity rule %r disabled" % name)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # serve
 # ---------------------------------------------------------------------------
 
@@ -506,7 +822,7 @@ def serve(ctx: click.Context, host: str, port: int) -> int:
         )
         return 2
     store = _open_store(ctx)
-    app = create_app(store)
+    app = create_app(store, home=_daemon_home())
     click.echo("serving dashboard at http://%s:%d (Ctrl+C to stop)" % (host, port))
     uvicorn.run(app, host=host, port=port, log_level="warning")
     store.close()

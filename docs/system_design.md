@@ -1362,3 +1362,131 @@ CFGDRIFT_DRIFT_ITEMS_JSON=[{"key":"worker_processes","baseline":"4","current":"2
 4. 前台扫描（`cfgdrift scan`）**不触发告警**（v0.3.0 范围仅 daemon 触发）。
 5. `alert test` 使用 `event=cfgdrift.test` 样本 payload，走重试，绕过防抖；成功 exit 0 / 失败 exit 2。
 6. 基线被删除/作用域不匹配的规则在 daemon 运行期只是不命中，不报错。
+
+---
+
+# 附录 C：v0.4.0 增量设计 — 多环境 compare + 自定义 severity + 敏感值脱敏 + 行号
+
+- 版本：v0.4.0
+- 作者：高见远（架构师 / software-architect），工程师寇豆码实现
+- 状态：已实现 + QA 第 4/5/6 轮独立验证通过（436 passed / 2 skipped 基线）
+
+## C.0 决策摘要
+
+| # | 决策点 | 结论 |
+|---|--------|------|
+| C1 | 敏感值脱敏放在哪一层？ | **检测/存储核心零感知**：diff 与数据库始终保存原始值；脱敏只在四个显示出口应用（终端渲染 / `report --json` / Web API / alert payload），保证历史数据可追溯、CI 解析不丢真值 |
+| C2 | 默认敏感关键词？ | 13 个 keyword 词干（`password/passwd/secret/token/api_key/apikey/access_token/auth_token/private_key/client_secret/credential/authorization/cookie`），按 key-path 分段做**大小写不敏感子串**匹配；裸 `key` **不在**列表，`key/key2/keyboard` 默认不脱敏 |
+| C3 | 行号如何与语义 diff 共存？ | 解析阶段额外产出 `line_maps = {relpath: {key_path: 1-based行号}}`；新增/修改项用新侧行号，REMOVED 项回退旧侧；compare 两基线无源文件 → `line=None` 不渲染 `:N` |
+| C4 | severity 覆盖规则的生效时机？ | 规则在**内置默认分类之后**应用，first-match-wins（文件顺序）；`summary.max_severity` 随覆盖更新，告警阈值零改动继续生效 |
+| C5 | severity 非法正则？ | **构造时校验**（`make_rule` 对 `key_pattern/value_pattern/file_pattern` 做 `re.compile()`），失败抛 `ValueError("invalid regex for <field>: <原因>")`，CLI exit 2；`SeverityRule.matches()` 运行时 try/except 容错逻辑保持不变 |
+| C6 | compare 基线版本展示？ | `CompareReport` 新增 `env1_version` / `env2_version`（双方基线版本号），CLI 终端头部 `compare A -> B (vX vs vY)` 展示，`--json` 一并导出；环境标签经 `environments.yaml` 映射后显示解析出的基线名 |
+| C7 | compare 出口脱敏？ | compare 是显示出口：CLI 加载 masking.yaml 的 `SensitiveMasker` 传入 `CompareEngine.compare(masker=...)`，返回前对 items 就地打码；数据库不受影响 |
+
+## C.1 增量实现方案（五项功能）
+
+1. **敏感值脱敏（masking）**：`core/masker.py` 的 `SensitiveMasker`（关键词 + fnmatch glob 模式 + 可配 mask 字符串）；`masking.yaml` 可选（`version/mask/keywords/patterns`），缺失/损坏回退默认值；四个显示出口统一接线。
+2. **行号（line numbers）**：`core/lines.py` 的 `build_line_map` 为 JSON/TOML/INI/YAML 提取 `key_path -> line`；`Scanner.scan_path_with_lines` 随快照持久化 `line_maps` 到基线；diff 渲染 `file:line`（`--no-line` 关闭）。
+3. **自定义 severity**：`core/model.SeverityRule`（`key_pattern/value_pattern/file_pattern/change_type` 可选正则）+ `rules/severity.py`（`severity.yaml` CRUD，文件权限 0600）+ differ 后置应用 + CLI `severity add/list/remove/enable/disable`。
+4. **多环境 compare**：`core/compare.py` 的 `CompareEngine`（解析 `environments.yaml` 映射、`compare_snapshots` 复用 SemanticDiffer、退出码 0/1/2）+ CLI `compare ENV1 ENV2...` 与 `diff --compare --env1 --env2` 别名 + `CompareReport.env1_version/env2_version`。
+5. **alert_events 存储 + daemon status_dict**：`storage/store.py` 新增 `alert_events` 表（sent/failed 记录、冷却抑制、prune）、`daemon/daemon.py` 新增 `status_dict()`；Web 新增 `/api/file-snippet`（基线扫描根校验 + 路径穿越 403）。
+
+## C.2 文件变更清单
+
+| 文件 | 变更 |
+|------|------|
+| `src/cfgdrift/cli.py` | 新增 `compare` 命令、`severity` 命令组；`diff --compare` 别名；compare 头部版本号 + 脱敏接线 |
+| `src/cfgdrift/core/compare.py` | 新增 `CompareEngine`（environments.yaml 解析、compare_snapshots、masker 参数） |
+| `src/cfgdrift/core/masker.py` | 新增 `SensitiveMasker`（13 关键词 + patterns + masking.yaml） |
+| `src/cfgdrift/core/lines.py` | 新增行号提取（JSON/TOML/INI/YAML） |
+| `src/cfgdrift/core/model.py` | `DriftItem.line/masked`、`SeverityRule`、`CompareReport.env1_version/env2_version` |
+| `src/cfgdrift/core/differ.py` | 应用 `severity_rules`（first-match-wins）更新 `max_severity` |
+| `src/cfgdrift/rules/severity.py` | severity.yaml CRUD + `make_rule` 校验（severity/change_type/regex） |
+| `src/cfgdrift/storage/store.py` | `line_maps` 持久化、`alert_events` 表 |
+| `src/cfgdrift/scanner/scanner.py` | `scan_path_with_lines` |
+| `src/cfgdrift/web/app.py` | `/api/file-snippet`、告警相关 API |
+| `src/cfgdrift/daemon/daemon.py` | `status_dict()` |
+| 测试 | `tests/test_v040_features.py`、`tests/test_qa_v050.py`、`tests/test_qa_v060.py` |
+
+## C.3 共享知识（跨文件约定，仅变更部分）
+
+### C.3.1 severity.yaml schema
+
+```yaml
+version: 1
+rules:
+  - name: tls-critical
+    enabled: true
+    severity: CRITICAL          # CRITICAL/WARN/INFO/NONE
+    change_type: modified       # 可选：added/removed/modified/type_changed
+    key_pattern: '.*tls\.enabled'  # 可选 regex（key_path）
+    value_pattern: null         # 可选 regex（old/new 值 JSON 序列化）
+    file_pattern: null          # 可选 regex（文件 relpath）
+```
+
+- 规则唯一键 `name`（`severity add` 重名报错 exit 2）；文件权限 0600。
+- 构造时（`make_rule`）校验 severity 枚举、change_type 枚举与三个 pattern 正则；非法正则错误消息 `invalid regex for key_pattern/value_pattern/file_pattern: <原因>`，CLI exit 2。
+- 应用语义：内置分类后 first-match-wins；`summary.max_severity` 随之更新。
+
+### C.3.2 masking.yaml schema
+
+```yaml
+version: 1
+mask: '******'                  # 可选，覆盖默认掩码
+keywords: []                   # 可选，显式替换默认 13 关键词
+patterns: []                   # 可选，fnmatch glob（全 key-path，大小写不敏感）
+```
+
+- 缺失/损坏 → 回退默认值 + warning，脱敏永不阻断工具。
+- 匹配：key-path 分段（`parse_path` 语义 + 数组下标拆分）大小写不敏感子串；`--sensitive-keys` 为**追加**语义。
+- 边界：裸 `key` 不敏感；数据库始终存 raw，仅显示出口打码。
+
+### C.3.3 environments.yaml schema
+
+```yaml
+version: 1
+environments:
+  prod: prod-baseline          # env 名 -> 基线名；缺省映射用 env 名当基线名
+```
+
+- 缺失 → `{}` 回退；损坏 → `{}` + warning（用 env 名兜底，不阻断）。
+
+### C.3.4 line_maps 结构与行号约定
+
+- 结构：`{relpath: {key_path: 1-based行号}}`；扫描时随基线持久化。
+- 渲染：diff 输出 `file:line`；`--no-line` 隐藏；REMOVED 项回退旧侧行号。
+- compare 两基线无源文件 → `line=None`，终端不渲染 `:N`，Web snippet 不可用。
+
+### C.3.5 CompareReport JSON schema（`compare --json`）
+
+```json
+{
+  "baseline_a": "dev",
+  "baseline_b": "prod",
+  "created_at": "...",
+  "env1_version": 1,
+  "env2_version": 1,
+  "summary": { "total": 1, "max_severity": "WARN", "...": "..." },
+  "items": [ { "key_path": "...", "old_value": "...", "masked": true, "...": "..." } ]
+}
+```
+
+- 终端头部：`compare <baseline_a> -> <baseline_b> (v<env1_version> vs v<env2_version>)`。
+- compare 出口按显示出口规则脱敏（`masked=true` 的项值为掩码）。
+
+### C.3.6 校验与容错边界
+
+- `make_rule`（severity）：severity/change_type/regex 全部构造时校验，非法即 exit 2。
+- `SeverityRule.matches()` / `IgnoreRule.matches()`：运行时 regex 异常 try/except 容错（返回不匹配），校验只在构造时，两者互不影响。
+
+## C.4 增量任务列表（按实现顺序）
+
+| 任务号 | 任务名 | 依赖 | 优先级 | 验收标准 |
+|--------|--------|------|--------|----------|
+| T01 | 版本升级 0.3.0 → 0.4.0 | 无 | P0 | `--version` 输出 0.4.0；C 扩展 `version()` 返回 0.4.0-c；既有 400 测试全绿 |
+| T02 | masking 层 | T01 | P0 | 13 默认关键词 + masking.yaml + 四出口接线；DB 存 raw；`--sensitive-keys` 追加；裸 `key` 不脱敏 |
+| T03 | 行号 | T01 | P0 | 四格式 line_maps；diff `file:line`；REMOVED 旧侧回退；compare line=None |
+| T04 | severity 规则 | T01 | P0 | severity.yaml CRUD；make_rule 校验（含非法 regex exit 2）；differ first-match-wins；max_severity 更新 |
+| T05 | compare | T01, T03 | P0 | CompareEngine + environments.yaml；退出码 0/1/2；`diff --compare` 别名；头部版本号 + 脱敏 |
+| T06 | alert_events + Web file-snippet | T01 | P1 | 事件落库/冷却/prune；`/api/file-snippet` 上下文 + 穿越 403 |
+

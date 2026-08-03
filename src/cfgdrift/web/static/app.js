@@ -27,9 +27,24 @@ function fmtTime(iso) {
   return d.toLocaleString();
 }
 
+function maskedBadge(it) {
+  return it && it.masked ? '<span class="masked-badge">已脱敏</span>' : "";
+}
+
+function locationCell(it) {
+  // v0.4.0: file:line as a clickable snippet link (falls back to plain file).
+  const file = esc(it.file || "-");
+  if (it.line != null && it.file) {
+    return '<span class="line-link" data-snippet-root="' + esc(it.snippet_root || "") +
+      '" data-snippet-file="' + esc(it.file) + '" data-snippet-line="' + it.line + '">' +
+      file + ":" + it.line + "</span>" + maskedBadge(it);
+  }
+  return file + maskedBadge(it);
+}
+
 function itemRows(items) {
   if (!items || !items.length) {
-    return '<tr><td colspan="7" class="muted">无漂移项</td></tr>';
+    return '<tr><td colspan="8" class="muted">无漂移项</td></tr>';
   }
   return items.map((it) => {
     const sev = it.severity || "NONE";
@@ -39,7 +54,7 @@ function itemRows(items) {
       '<td><span class="badge ' + sevClass(sev) + '">' + esc(sev) + "</span></td>" +
       "<td>" + esc(where) + "</td>" +
       "<td>" + esc(it.change_type) + "</td>" +
-      "<td>" + esc(it.file) + "</td>" +
+      "<td>" + locationCell(it) + "</td>" +
       "<td>" + esc(JSON.stringify(it.old_value)) + "</td>" +
       "<td>" + esc(JSON.stringify(it.new_value)) + "</td>" +
       "<td>" + esc(it.rule_id == null ? "-" : "#" + it.rule_id) + "</td>" +
@@ -57,8 +72,26 @@ async function renderOverview() {
   const latest = data.latest_scan;
   const s = latest ? latest.summary : { added: 0, removed: 0, modified: 0, type_changed: 0, ignored: 0, total: 0, max_severity: "NONE" };
   const t = data.totals || {};
+  const ds = data.daemon_status || {};
+  const daemonCard =
+    '<div class="card">' +
+    '<h3 style="margin-bottom:8px">守护进程</h3>' +
+    (ds.running
+      ? '<p><span class="badge b-info">运行中</span> pid=' + esc(ds.pid) +
+        (ds.info && ds.info.baseline ? " · baseline=" + esc(ds.info.baseline) : "") +
+        (ds.info && ds.info.interval ? " · interval=" + esc(ds.info.interval) + "s" : "") +
+        "</p>"
+      : '<p><span class="badge b-none">未运行</span>' +
+        (ds.stale ? ' <span class="muted">(残留 PID 已清理)</span>' : "") +
+        (ds.error ? ' <span style="color:var(--critical)">' + esc(ds.error) + "</span>" : "") +
+        "</p>") +
+    (ds.last_scan
+      ? '<p class="muted">最近守护扫描 #' + ds.last_scan.scan_id + " · " + fmtTime(ds.last_scan.created_at) + "</p>"
+      : "") +
+    "</div>";
   $("#view-overview").innerHTML =
     '<h2>概览</h2>' +
+    daemonCard +
     '<div class="card">' +
     "<p class=\"muted\">共 " + data.scan_count + " 次扫描 · " + data.baseline_count + " 个基线</p>" +
     "<p>最近扫描 #" + (latest ? latest.scan_id : "-") +
@@ -181,12 +214,17 @@ async function loadReport() {
   const sev = $("#reportSev").value;
   const payload = await api("/api/reports/" + scanId);
   const data = payload.data;
-  let items = data.items || [];
+  let items = (data.items || []).map((it) => {
+    // Enrich items with the baseline scan root so the snippet modal can
+    // validate against a known root.
+    it.snippet_root = data.scan_root || "";
+    return it;
+  });
   if (sev) items = items.filter((it) => it.severity === sev);
   $("#reportBody").innerHTML =
     "<p class=\"muted\">#" + data.scan_id + " · " + fmtTime(data.created_at) + " · mode=" + data.mode +
     (data.baseline ? " · baseline=" + data.baseline.name + " v" + data.baseline.version : "") + "</p>" +
-    '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件</th><th>旧值</th><th>新值</th><th>规则</th></tr></thead>' +
+    '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th></tr></thead>' +
     "<tbody>" + itemRows(items) + "</tbody></table>";
 }
 
@@ -253,6 +291,102 @@ async function renderRules() {
 }
 
 // ---------------------------------------------------------------------------
+// Alerts view (v0.4.0)
+// ---------------------------------------------------------------------------
+
+let alertPage = 0;
+const ALERT_PAGE_SIZE = 50;
+
+async function renderAlerts() {
+  const [alertsData, eventsData] = await Promise.all([
+    api("/api/alerts"),
+    api("/api/alert-events?limit=" + ALERT_PAGE_SIZE + "&offset=" + alertPage * ALERT_PAGE_SIZE),
+  ]);
+  const alerts = alertsData.alerts || [];
+  const events = eventsData.events || [];
+  const total = eventsData.total || 0;
+
+  const ruleTable =
+    '<div class="card"><h3 style="margin-bottom:10px">告警规则（alerts.yaml）</h3>' +
+    '<table><thead><tr><th>名称</th><th>类型</th><th>阈值</th><th>基线</th><th>状态</th></tr></thead><tbody>' +
+    (alerts.length ? alerts.map((r) =>
+      "<tr><td><strong>" + esc(r.name) + "</strong></td><td>" + esc(r.type) + "</td><td>" +
+      '<span class="badge ' + sevClass(r.severity) + '">' + esc(r.severity) + "</span></td><td>" +
+      esc(r.baseline || "all") + "</td><td>" + (r.enabled ? "启用" : "停用") + "</td></tr>"
+    ).join("") : '<tr><td colspan="5" class="muted">暂无告警规则（使用 <code>cfgdrift alert add</code> 添加）</td></tr>') +
+    "</tbody></table></div>";
+
+  const eventTable =
+    '<div class="card"><h3 style="margin-bottom:10px">告警事件（最近 ' + ALERT_PAGE_SIZE + " 条 / 共 " + total + " 条）</h3>" +
+    '<div class="form-row">' +
+    '<input id="alertFilterRule" placeholder="规则名筛选" value="' + esc(currentAlertFilter.rule || "") + '">' +
+    '<select id="alertFilterStatus"><option value="">全部状态</option><option value="sent"' + (currentAlertFilter.status === "sent" ? " selected" : "") + '>sent</option><option value="failed"' + (currentAlertFilter.status === "failed" ? " selected" : "") + '>failed</option></select>' +
+    '<select id="alertFilterSeverity"><option value="">全部严重度</option><option>CRITICAL</option><option>WARN</option><option>INFO</option><option>NONE</option></select>' +
+    '<button class="action" id="alertFilterApply">筛选</button>' +
+    "</div>" +
+    '<table><thead><tr><th>ID</th><th>规则</th><th>基线</th><th>严重度</th><th>状态</th><th>目标</th><th>次数</th><th>时间</th><th>错误</th></tr></thead><tbody>' +
+    (events.length ? events.map((ev) =>
+      "<tr><td>#" + ev.id + "</td><td>" + esc(ev.rule) + "</td><td>" + esc(ev.baseline) + "</td><td>" +
+      '<span class="badge ' + sevClass(ev.severity) + '">' + esc(ev.severity) + "</span></td><td>" +
+      (ev.status === "sent"
+        ? '<span class="badge b-info">sent</span>'
+        : '<span class="badge b-critical">failed</span>') +
+      "</td><td>" + esc(ev.target || "-") + "</td><td>" + ev.attempts + "</td><td>" + fmtTime(ev.created_at) + "</td><td>" +
+      (ev.error ? '<span class="event-error">' + esc(ev.error) + "</span>" : "-") + "</td></tr>"
+    ).join("") : '<tr><td colspan="9" class="muted">暂无告警事件</td></tr>') +
+    "</tbody></table>" +
+    '<div class="pager">' +
+    '<button id="alertPrev" ' + (alertPage === 0 ? "disabled" : "") + ">上一页</button>" +
+    "<span>第 " + (alertPage + 1) + " 页</span>" +
+    '<button id="alertNext" ' + ((alertPage + 1) * ALERT_PAGE_SIZE >= total ? "disabled" : "") + ">下一页</button>" +
+    "</div></div>";
+
+  $("#view-alerts").innerHTML = "<h2>告警管理</h2>" + ruleTable + eventTable;
+
+  $("#alertFilterApply").addEventListener("click", () => {
+    currentAlertFilter.rule = $("#alertFilterRule").value.trim();
+    currentAlertFilter.status = $("#alertFilterStatus").value;
+    currentAlertFilter.severity = $("#alertFilterSeverity").value;
+    alertPage = 0;
+    renderAlerts();
+  });
+  $("#alertPrev").addEventListener("click", () => {
+    if (alertPage > 0) { alertPage -= 1; renderAlerts(); }
+  });
+  $("#alertNext").addEventListener("click", () => {
+    if ((alertPage + 1) * ALERT_PAGE_SIZE < total) { alertPage += 1; renderAlerts(); }
+  });
+}
+
+const currentAlertFilter = { rule: "", status: "", severity: "" };
+
+// ---------------------------------------------------------------------------
+// Line-snippet modal (v0.4.0)
+// ---------------------------------------------------------------------------
+
+async function openSnippet(root, file, line) {
+  const url = "/api/file-snippet?root=" + encodeURIComponent(root) +
+    "&file=" + encodeURIComponent(file) + "&line=" + encodeURIComponent(line);
+  const data = await api(url);
+  const rows = (data.snippet || []).map((r) =>
+    '<span class="src-line' + (r.line === data.line ? " hl" : "") + '">' + r.line + "</span>" +
+    esc(r.text)
+  ).join("\n");
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+  overlay.innerHTML =
+    '<div class="modal">' +
+    '<div class="modal-head"><h3>' + esc(file) + ":" + data.line + "</h3>" +
+    '<button class="modal-close">&times;</button></div>' +
+    '<div class="modal-body"><pre>' + rows + "</pre></div></div>";
+  document.body.appendChild(overlay);
+  overlay.querySelector(".modal-close").addEventListener("click", () => overlay.remove());
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Navigation
 // ---------------------------------------------------------------------------
 
@@ -263,9 +397,13 @@ const VIEWS = {
   reports: renderReports,
   baselines: renderBaselines,
   rules: renderRules,
+  alerts: renderAlerts,
 };
 
+let currentView = "overview";
+
 function switchView(name) {
+  currentView = name;
   document.querySelectorAll("nav button").forEach((b) => {
     b.classList.toggle("active", b.dataset.view === name);
   });
@@ -282,5 +420,24 @@ function switchView(name) {
 document.querySelectorAll("nav button").forEach((btn) => {
   btn.addEventListener("click", () => switchView(btn.dataset.view));
 });
+
+// Delegate snippet clicks (event delegation survives re-renders).
+document.addEventListener("click", (e) => {
+  const link = e.target.closest(".line-link");
+  if (link) {
+    openSnippet(
+      link.dataset.snippetRoot || "",
+      link.dataset.snippetFile || "",
+      link.dataset.snippetLine || "1"
+    ).catch((err) => alert("无法加载代码片段：" + err.message));
+  }
+});
+
+// v0.4.0: poll the overview (daemon status card) every 30s while visible.
+setInterval(() => {
+  if (currentView === "overview") {
+    renderOverview().catch(() => { /* keep the dashboard alive */ });
+  }
+}, 30000);
 
 switchView("overview");

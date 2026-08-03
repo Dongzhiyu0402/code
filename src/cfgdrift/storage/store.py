@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from ..core.model import Baseline, IgnoreRule
@@ -74,9 +74,33 @@ CREATE TABLE IF NOT EXISTS ignore_rules (
     FOREIGN KEY (baseline_id) REFERENCES baselines(id)
 );
 
+-- v0.4.0: alert delivery events (sent/failed only; cooldown-suppressed and
+-- connectivity-test sends are never recorded).
+CREATE TABLE IF NOT EXISTS alert_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule        TEXT NOT NULL,
+    baseline    TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    target      TEXT,
+    drift_count INTEGER NOT NULL DEFAULT 0,
+    error       TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 1,
+    fingerprint TEXT,
+    created_at  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_scans_created ON scans(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_scan_items_scan ON scan_items(scan_id);
+CREATE INDEX IF NOT EXISTS idx_alert_events_created ON alert_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events(rule);
+CREATE INDEX IF NOT EXISTS idx_alert_events_status ON alert_events(status);
 """
+
+# Lazy pruning is triggered every N alert-event inserts (v0.4.0).
+_ALERT_EVENT_PRUNE_EVERY = 100
+_ALERT_EVENT_RETENTION_DAYS = 30
+_ALERT_EVENT_MAX_ROWS = 5000
 
 
 class Store:
@@ -94,13 +118,30 @@ class Store:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
+        # v0.4.0: lazy alert-event pruning counter (prune every N inserts).
+        self._alert_insert_count = 0
         self.init_schema()
 
     # -- schema -----------------------------------------------------------
 
     def init_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
+        # Idempotent migration for the v0.4.0 ``line_maps`` column on existing
+        # databases (guarded by PRAGMA table_info so re-running is a no-op).
+        columns = [
+            r["name"] for r in self._conn.execute("PRAGMA table_info(baselines)")
+        ]
+        if "line_maps" not in columns:
+            self._conn.execute("ALTER TABLE baselines ADD COLUMN line_maps TEXT")
         self._conn.commit()
+
+    @staticmethod
+    def _row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+        """Access a Row column defensively (columns may be absent pre-migration)."""
+        try:
+            return row[key]
+        except (IndexError, KeyError):
+            return default
 
     def close(self) -> None:
         self._conn.close()
@@ -114,8 +155,14 @@ class Store:
         scan_root: str,
         format: str,
         data: dict,
+        line_maps: Optional[dict] = None,
     ) -> Baseline:
-        """Create a new baseline version (same name -> version + 1)."""
+        """Create a new baseline version (same name -> version + 1).
+
+        ``line_maps`` (v0.4.0) is an optional ``{relpath: {key_path: line}}``
+        map captured when the baseline was created; it is persisted as JSON so
+        REMOVED drift items can fall back to old-side line numbers.
+        """
         row = self._conn.execute(
             "SELECT COALESCE(MAX(version), 0) AS v FROM baselines WHERE name = ?",
             (name,),
@@ -124,7 +171,7 @@ class Store:
         created = utcnow_iso()
         cur = self._conn.execute(
             "INSERT INTO baselines (name, version, description, created_at, "
-            "scan_root, format, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "scan_root, format, data, line_maps) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 name,
                 version,
@@ -133,6 +180,9 @@ class Store:
                 os.path.normpath(os.path.abspath(scan_root)),
                 format,
                 json.dumps(data, ensure_ascii=False),
+                json.dumps(line_maps, ensure_ascii=False)
+                if line_maps
+                else None,
             ),
         )
         self._conn.commit()
@@ -145,6 +195,7 @@ class Store:
             scan_root=os.path.normpath(os.path.abspath(scan_root)),
             format=format,
             data=data,
+            line_maps=line_maps,
         )
 
     def list_baselines(self) -> List[Baseline]:
@@ -207,6 +258,7 @@ class Store:
         return self.get_baseline(name)
 
     def _baseline_from_row(self, row: sqlite3.Row) -> Baseline:
+        line_maps = self._row_get(row, "line_maps")
         return Baseline(
             id=int(row["id"]),
             name=row["name"],
@@ -216,6 +268,7 @@ class Store:
             scan_root=row["scan_root"],
             format=row["format"],
             data=json.loads(row["data"] or "{}"),
+            line_maps=json.loads(line_maps) if line_maps else None,
         )
 
     # -- scans ------------------------------------------------------------
@@ -390,3 +443,108 @@ class Store:
         self._conn.commit()
         if cur.rowcount == 0:
             raise ValueError("ignore rule %d not found" % rule_id)
+
+    # -- alert events (v0.4.0) -------------------------------------------
+
+    def add_alert_event(self, event: Dict[str, Any]) -> int:
+        """Record one alert delivery event (sent/failed); returns its id.
+
+        Lazy pruning: every ``_ALERT_EVENT_PRUNE_EVERY`` inserts a prune pass
+        keeps the table bounded without a separate maintenance job.
+        """
+        cur = self._conn.execute(
+            "INSERT INTO alert_events (rule, baseline, severity, status, "
+            "target, drift_count, error, attempts, fingerprint, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(event.get("rule", "")),
+                str(event.get("baseline", "")),
+                str(event.get("severity", "NONE")),
+                str(event.get("status", "sent")),
+                event.get("target"),
+                int(event.get("drift_count", 0)),
+                event.get("error"),
+                int(event.get("attempts", 1)),
+                event.get("fingerprint"),
+                event.get("created_at") or utcnow_iso(),
+            ),
+        )
+        self._conn.commit()
+        event_id = int(cur.lastrowid)
+        self._alert_insert_count += 1
+        if self._alert_insert_count >= _ALERT_EVENT_PRUNE_EVERY:
+            self._alert_insert_count = 0
+            self.prune_alert_events(
+                days=_ALERT_EVENT_RETENTION_DAYS,
+                max_rows=_ALERT_EVENT_MAX_ROWS,
+            )
+        return event_id
+
+    def list_alert_events(
+        self,
+        rule: Optional[str] = None,
+        status: Optional[str] = None,
+        severity: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Return ``{"events": [...], "total": N}`` with filters + pagination."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if rule:
+            clauses.append("rule = ?")
+            params.append(rule)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if severity:
+            clauses.append("severity = ?")
+            params.append(severity)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        total_row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM alert_events %s" % where, params
+        ).fetchone()
+        total = int(total_row["c"])
+
+        rows = self._conn.execute(
+            "SELECT id, rule, baseline, severity, status, target, drift_count, "
+            "error, attempts, fingerprint, created_at FROM alert_events %s "
+            "ORDER BY id DESC LIMIT ? OFFSET ?" % where,
+            params + [int(limit), int(offset)],
+        ).fetchall()
+        events = [dict(r) for r in rows]
+        return {"events": events, "total": total}
+
+    def count_alert_events(self) -> int:
+        """Total number of recorded alert events."""
+        row = self._conn.execute("SELECT COUNT(*) AS c FROM alert_events").fetchone()
+        return int(row["c"])
+
+    def prune_alert_events(self, days: int = 30, max_rows: int = 5000) -> int:
+        """Delete events older than ``days`` and cap the table at ``max_rows``.
+
+        Returns the number of deleted rows.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+        ).isoformat()
+        cur = self._conn.execute(
+            "DELETE FROM alert_events WHERE created_at < ?", (cutoff,)
+        )
+        removed = int(cur.rowcount)
+        # Cap by age first, then by row count (delete the oldest excess).
+        count_row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM alert_events"
+        ).fetchone()
+        excess = int(count_row["c"]) - max(0, int(max_rows))
+        if excess > 0:
+            cur2 = self._conn.execute(
+                "DELETE FROM alert_events WHERE id IN ("
+                "SELECT id FROM alert_events ORDER BY id ASC LIMIT ?)",
+                (excess,),
+            )
+            removed += int(cur2.rowcount)
+        if removed:
+            self._conn.commit()
+        return removed
