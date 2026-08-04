@@ -1,0 +1,63 @@
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as cli diff/scan
+    participant SC as Scanner
+    participant ST as Store
+    participant DF as SemanticDiffer
+    participant CE as ConstraintEngine
+    participant RP as Reporter
+
+    U->>CLI: diff PATH --baseline B [--builtin/--no-builtin] [--constraints F]
+    CLI->>CLI: 解析生效约束（builtin + constraints.yaml + --constraints，同 id 后者覆盖）
+    CLI->>SC: scan_path_with_lines(PATH, fmt)
+    SC-->>CLI: (snapshot, line_maps)
+    CLI->>ST: get_baseline(B) + list_rules(baseline_id)
+    CLI->>DF: diff_snapshot(baseline.data, snapshot, rules, severity_rules, constraints=...)
+    DF->>DF: _diff_node → 原始 items（内置 severity）
+    DF->>DF: _apply_custom_severity(items, severity_rules)
+    DF->>CE: apply_constraints(snapshot, items, constraints)
+    CE->>CE: 逐文件：drift_keys → 逐约束 check_one(tree)
+    CE->>CE: 关联判定（involved_keys ∩ drift_keys ≠ ∅）→ 附加 violation + 升级 severity
+    CE-->>DF: items（constraint_violations 已挂、severity 已升级）
+    DF->>DF: _finalize(items, rules) → summary（max_severity 反映升级）
+    DF-->>CLI: (items, summary)
+    CLI->>ST: add_scan(mode=manual)（violations 随 report_json 持久化）
+    CLI->>RP: render_terminal / render_json（条件输出 constraint_violations）
+    CLI-->>U: 复合告警（severity 升级 + constraint 行/字段）
+
+sequenceDiagram
+    autonumber
+    participant W as DaemonWorker._scan_one
+    participant CE as ConstraintEngine
+    participant ST as Store
+    participant DP as AlertDispatcher
+    participant PM as build_drift_payload
+
+    loop 每周期（interval）
+        W->>W: _load_constraints()（重读 builtin + constraints.yaml + --constraints）
+        W->>W: scan_path_with_lines → snapshot
+        W->>W: diff_snapshot(baseline.data, snapshot, constraints=约束) → items（含 violation + 升级）
+        W->>ST: add_scan(mode="daemon")（report_json 含 constraint_violations）
+        alt summary.total > 0
+            W->>DP: dispatch_report(baseline, target, report)
+            DP->>PM: build_drift_payload(report, ...)
+            PM->>PM: 每个含 violation 的 item 加 "constraint": {id,type,message,involved_keys}
+            PM-->>DP: payload → 通道发送（防抖/重试不变）
+        end
+    end
+
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as cli constraint add
+    participant CFG as ConstraintConfig
+    participant FS as constraints.yaml
+
+    U->>CLI: constraint add --rule '{"id":"my_port","type":"range",...}'
+    CLI->>CLI: json.loads + Constraint.from_dict(source="user")（非法 → ValueError exit 2）
+    CLI->>CFG: add_rule(<home>/constraints.yaml, constraint)
+    CFG->>FS: load 现有 rules → 追加（同 id 已存在 → ValueError）→ save
+    CFG-->>U: constraint 'my_port' added
+    Note over U: 下次 diff/scan 时 _load_constraints 读回该文件 → 立即生效
+    Note over U: daemon 下周期重载 → 周期生效（D9）

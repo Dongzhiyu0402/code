@@ -29,7 +29,10 @@ from ..alert.dispatcher import AlertDispatcher
 from ..alert.state import AlertStateStore
 from ..core.differ import SemanticDiffer
 from ..core.masker import SensitiveMasker, masking_config_path
-from ..core.model import Report, ScanSummary
+from ..core.model import Constraint, Report, ScanSummary
+from ..rules.constraints import (
+    resolve as resolve_constraints,
+)
 from ..rules.severity import SeverityConfig, default_path as severity_config_path
 from ..scanner.scanner import Scanner
 from ..storage.store import Store, utcnow_iso
@@ -111,6 +114,9 @@ class DaemonWorker:
         log: Optional[logging.Logger] = None,
         masker: Optional[SensitiveMasker] = None,
         severity_rules: Optional[List[Any]] = None,
+        home: Optional[str] = None,  # v0.6.0: constraints.yaml location
+        builtin_enabled: bool = True,  # v0.6.0
+        constraint_paths: Optional[List[str]] = None,  # v0.6.0
     ) -> None:
         self.store_path = os.path.abspath(store_path)
         self.paths = [os.path.abspath(p) for p in paths]
@@ -125,11 +131,30 @@ class DaemonWorker:
         self.log = log or logger
         self.masker = masker
         self.severity_rules = list(severity_rules or [])
+        self.home = home or default_home()
+        self.builtin_enabled = bool(builtin_enabled)
+        self.constraint_paths = list(constraint_paths or [])
+        self._constraints: Optional[List[Constraint]] = None
         self._stop_event = threading.Event()
         self._scanner = Scanner()
         self._differ = SemanticDiffer()
 
     # -- public API -------------------------------------------------------
+
+    def _load_constraints(self) -> List[Constraint]:
+        """Resolve the effective constraints (re-read every cycle, D9).
+
+        Delegates to :func:`cfgdrift.rules.constraints.resolve` (D8): built-in
+        library (if enabled) + <home>/constraints.yaml (if present) + each
+        extra --constraints file.  A corrupt/missing user file raises so the
+        failure is logged and the daemon keeps running (previous cycle's
+        constraints stay effective in memory).
+        """
+        return resolve_constraints(
+            self.home,
+            extra_paths=list(self.constraint_paths),
+            builtin_enabled=self.builtin_enabled,
+        )
 
     def run(self, readiness_fd: Optional[int] = None) -> int:
         """Run the scan loop until a stop is requested; returns exit code.
@@ -184,6 +209,9 @@ class DaemonWorker:
             self.interval,
         )
         try:
+            # D9: reload constraints every cycle so `constraint add` takes
+            # effect on the next scan (severity_rules stay startup-loaded).
+            self._constraints = self._load_constraints()
             for path in self.paths:
                 self._scan_one(store, path)
         except Exception as exc:  # noqa: BLE001 - keep daemon alive
@@ -203,6 +231,7 @@ class DaemonWorker:
             severity_rules=self.severity_rules,
             old_lines=baseline.line_maps,
             new_lines=line_maps,
+            constraints=self._constraints,
         )
         report = Report(
             scan_id=None,
@@ -396,6 +425,11 @@ def build_worker_command(home: str, opts: Dict[str, Any]) -> List[str]:
         cmd += ["--alerts-config", alerts_config]
     if alert_state:
         cmd += ["--alert-state", alert_state]
+    # v0.6.0: built-in constraint library + extra constraint files.
+    if opts.get("builtin") is False:
+        cmd += ["--no-builtin"]
+    for extra in opts.get("constraint_paths", []) or []:
+        cmd += ["--constraints", extra]
     for target in opts.get("targets", []) or opts.get("paths", []):
         cmd += ["--path", target]
     return cmd
@@ -482,6 +516,9 @@ def run_with_opts(opts: Dict[str, Any]) -> int:
         log=log,
         masker=masker,
         severity_rules=severity_rules,
+        home=opts.get("home"),
+        builtin_enabled=opts.get("builtin", True) is not False,
+        constraint_paths=opts.get("constraint_paths") or [],
     )
     # POSIX daemonize passes a readiness fd; Windows/foreground do not.
     readiness_fd = opts.get("readiness_fd")
@@ -521,6 +558,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--alerts-config", default=None)
     parser.add_argument("--alert-state", default=None)
     parser.add_argument("--foreground", action="store_true")
+    # v0.6.0: consistency constraints.  The built-in toggle is an explicit
+    # flag pair (argparse has no --flag/--no-flag shortcut syntax; writing
+    # "--builtin/--no-builtin" would be parsed as one value-taking option).
+    parser.add_argument("--builtin", dest="builtin", action="store_true",
+                        default=True,
+                        help="Enable the built-in constraint library (default: on).")
+    parser.add_argument("--no-builtin", dest="builtin", action="store_false",
+                        help="Disable the built-in constraint library.")
+    parser.add_argument("--constraints", dest="constraint_files",
+                        action="append", default=[],
+                        help="Extra constraints.yaml file (repeatable; v0.6.0).")
     args = parser.parse_args(argv)
 
     home = args.home or default_home()
@@ -541,6 +589,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "alert_state": args.alert_state
         or (os.path.join(home, "alert_state.json") if home else None),
         "foreground": args.foreground,
+        "builtin": args.builtin,
+        "constraint_paths": list(args.constraint_files),
     }
     return run_with_opts(opts)
 

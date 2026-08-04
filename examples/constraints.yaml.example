@@ -1,0 +1,68 @@
+# cfgdrift constraints.yaml 模板（v0.6.0）
+#
+# 一致性约束：在 diff/scan/daemon 检出漂移后，对「变更后配置树」执行约束检查，
+# 仅报告与本次漂移关联的约束破坏（D5），并升级受影响项的 severity（Q1）。
+#
+# 使用方式：
+#   1. 复制本文件到 <home>/constraints.yaml（CFGDRIFT_HOME 或 ~/.cfgdrift），
+#      下次 diff/scan 自动生效；daemon 下个周期生效（D9）。
+#   2. 或通过 `cfgdrift constraint add --rule '<JSON>'` 添加。
+#   3. 或通过 `cfgdrift diff --constraints PATH` 临时附加额外文件。
+#
+# schema：version 必须为 1；rules 为列表，每项字段见下（type 五选一）。
+#
+# 公共字段：
+#   id       必填，唯一
+#   type     range | enum | conditional_required | correlation | mutual_exclusion
+#   message  必填，支持 {key}/{value}/{min}/{max} 占位（未知占位符原样保留）
+#   severity 可选，默认 WARN（CRITICAL/WARN/INFO/NONE）
+#   enabled  可选，默认 true
+#   source   可选，默认 user（builtin/user；不写即可）
+#
+# 损坏文件 -> ValueError -> CLI exit 2（绝不静默忽略）。
+# 同 id 的后者覆盖前者（可覆盖内置库；`constraint list --source builtin` 查看内置库）。
+version: 1
+rules:
+  # --- range：单个数值键的上下界（keys 长度 1；min/max 至少给一个）---
+  - id: my_port_range
+    type: range
+    keys: [server.port]
+    min: 1
+    max: 65535
+    message: "server.port 必须在 [1, 65535] 范围内"
+    severity: WARN
+    enabled: true
+
+  # --- enum：单个键的值必须在 allowed 白名单内 ---
+  - id: my_log_level
+    type: enum
+    keys: [logging.level]
+    allowed: [debug, info, warn, error]
+    message: "logging.level 必须是 debug/info/warn/error 之一"
+
+  # --- conditional_required：when 条件满足时 then.require 的键必须存在 ---
+  # {key} 在运行时替换为缺失键路径
+  - id: my_tls_cert
+    type: conditional_required
+    when: {key: tls.enabled, value: true}
+    then: {require: [tls.cert_path, tls.key_path]}
+    message: "{key} 缺失（tls.enabled=true 需要该字段）"
+    severity: CRITICAL
+
+  # --- correlation：when 条件满足时 then 的数值/字符串关系必须成立 ---
+  # then 可为单个 {key, op, value} 或列表；op ∈ >=,>,<=,<,==,!=
+  - id: my_cluster_replicas
+    type: correlation
+    when: {key: mode, value: cluster}
+    then:
+      - {key: replicas, op: ">=", value: 3}
+    message: "mode=cluster 时 replicas 必须 >= 3"
+
+  # --- mutual_exclusion：两键互斥；forbid 可选（缺省=两键同时存在即冲突）---
+  # forbid 形如 [[v1, v2], ...]，对应 keys[0] 取 v1 且 keys[1] 取 v2 时冲突
+  - id: my_http_ssl
+    type: mutual_exclusion
+    keys: [protocol, ssl]
+    forbid: [[http, on]]
+    message: "protocol=http 与 ssl=on 冲突"
+    severity: CRITICAL

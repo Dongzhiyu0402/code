@@ -85,6 +85,16 @@ class Reporter:
                     "%s %s (%s): %s %s -> %s"
                     % (tag, where, location, label, old, new)
                 )
+            # v0.6.0: consistency-constraint violations (one line per break).
+            for violation in getattr(item, "constraint_violations", None) or []:
+                lines.append(
+                    "    constraint %s [%s]: %s"
+                    % (
+                        violation.get("constraint_id", "?"),
+                        violation.get("type", "?"),
+                        violation.get("message", ""),
+                    )
+                )
 
         s = report.summary
         lines.append(

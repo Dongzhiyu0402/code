@@ -64,3 +64,25 @@ env_check.txt
 demo_check*/
 demo_staging/
 dist-v040/
+dist-v050/
+
+# v0.6.0 调试/临时产物
+.final_gate.txt
+.v050_install_test/
+_bug1*/
+_bug1_*.txt
+_new_tests_v060*.txt
+_pytest_bug1*.txt
+_pytest_py313*.txt
+_pytest_py38*.txt
+_pytest_v060*.txt
+_qa7_*.txt
+_qa7_*/
+_qa_v060_*/
+_qa_e2e/
+_qa_readme/
+_qa_target/
+.qa_r6_*.txt
+_qa7_fix_e2e.py
+demo_gate*/
+demo_gate2/

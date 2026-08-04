@@ -28,13 +28,14 @@
 - `cfgdrift alert add --retry-count N --retry-delay ...`：规则级告警重试（总尝试次数 + 尝试间等待，缺省回退全局默认 3 次 1s/5s/30s）
 - **敏感值脱敏**：终端 / JSON 报告 / HTML 报告 / Web API / 告警 payload 五个显示出口对 `password` / `token` / `secret` 等 13 类敏感键自动打码（`masking.yaml` 可定制，数据库始终保存原始值）
 - **行号定位**：diff / compare 输出标明 `file:line`，便于快速定位漂移源
+- **一致性约束（v0.6.0）**：在语义 diff 之上叠加约束检查层，对「变更后配置树」跑 range / enum / conditional_required / correlation / mutual_exclusion 五类约束，仅报告**与本次漂移关联**的约束破坏，输出确定性可解释的复合告警（severity 升级 + `constraint_violations`）
 - **自定义解析器插件**：`--format <plugin>` 支持第三方解析格式（见下文「自定义解析器插件」）
 
 退出码：`0`=无漂移，`1`=检出漂移，`2`=错误。
 
 ## 安装
 
-自 v0.2.0 起（当前版本 v0.5.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
+自 v0.2.0 起（当前版本 v0.6.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
 的通用包：C 扩展是可选加速器，未编译或安装失败时自动降级到纯 Python 解析器。
 
 ```bash
@@ -150,9 +151,50 @@ cfgdrift alert add --name x --type webhook --url http://x --retry-delay 1 --retr
 cfgdrift report --scan-id 3 --html out.html   # 单文件离线 HTML，可直接浏览器打开
 ```
 
-- 摘要卡 + 严重度分布条 + 变更列表（严重度徽标 / 键路径 / 变更类型 / 文件:行 / 旧值→新值 / 规则）
+- 摘要卡 + 严重度分布条 + 变更列表（严重度徽标 / 键路径 / 变更类型 / 文件:行 / 旧值→新值 / 规则 / 约束违反）
 - `masked=true` 的项显示「已脱敏」徽标；严重度配色与 Web 仪表盘一致
 - Web 报告页同样提供「导出 HTML」按钮（`GET /api/reports/{scan_id}/html`）
+
+## 一致性约束（v0.6.0）
+
+一致性约束在语义 diff 之上叠加一层**约束检查**：`diff` / `scan` / `daemon` 检出漂移后，
+对「变更后配置树」执行约束检查，**仅报告与本次漂移关联**的约束破坏（Q2：存量违反 P0 不报），
+输出确定性可解释的复合告警（severity 升级 + `constraint_violations`）。不依赖外部业务真值。
+
+```bash
+# diff / scan 默认启用内置约束库（20 条，四域：web/db/log/auth × 五类）
+cfgdrift diff ./config --baseline prod
+cfgdrift diff ./config --baseline prod --no-builtin          # 关闭内置库
+cfgdrift diff ./config --baseline prod --constraints extra.yaml   # 追加额外约束文件（可重复）
+
+# constraint 子命令：管理 <home>/constraints.yaml（version: 1）
+cfgdrift constraint add --rule '{"id":"my_port","type":"range","keys":["server.port"],"min":1,"max":65535,"message":"server.port 必须 <= 65535"}'
+cfgdrift constraint list                  # 生效视角（builtin + user 合并，同 id 后者覆盖）
+cfgdrift constraint list --source builtin # 只看内置库；--source user 只看 constraints.yaml
+cfgdrift constraint remove my_port
+cfgdrift constraint disable my_port       # / enable my_port
+```
+
+- **五类约束**：`range`（数值区间）、`enum`（白名单）、`conditional_required`
+  （条件满足时必填键）、`correlation`（条件满足时数值/字符串关系）、`mutual_exclusion`
+  （两键互斥）。完整 schema 见 `examples/constraints.yaml.example`。
+- **升级制（Q1）**：`new = min(CRITICAL, max(item.rank+1, max(违反约束.rank)))`，
+  复用 `Severity.rank`（NONE=0 / INFO=1 / WARN=2 / CRITICAL=3），不引入独立 CONSTRAINT 级别；
+  每个 item 只升级一次（全部 violation 附加后统一计算）。
+- **关联判定（D5）**：逐文件，`involved_keys ∩ 漂移 keys ≠ ∅` 即关联；violation 附加到所有
+  `key_path ∈ involved_keys` 的漂移项；缺失键 / 不满足 when 的约束一律跳过（零噪音基础）。
+- **五处呈现**：terminal（项后追加 `constraint <id> [<type>]: <message>`）、JSON
+  （`DriftItem.to_dict()` 仅非空输出 `constraint_violations`）、HTML（新增「约束违反」列）、
+  Web 仪表盘（报告页/告警列表徽标+消息）、alert payload（每项 `constraint` 字段，首条按
+  `constraint_id` 排序确定）。
+- **生效约束解析（D8）**：内置库（`--builtin` 默认 on）→ `<home>/constraints.yaml`（若存在）
+  → `--constraints` 额外文件（可重复，按序）；同 id 后者覆盖前者（可覆盖内置库）。
+- **daemon 生效时机（D9）**：worker 每周期重载约束文件，`constraint add` 下个周期生效；
+  `severity_rules` 维持启动时加载。
+- **零噪音契约（D7）**：合法变更（如 `server.port` 8080→9090 在范围内）输出与 v0.5.0
+  逐字节一致——无 `constraint_violations` 字段、terminal 不新增行、HTML 新列显示 `-`、
+  alert payload 无 `constraint` 字段。
+- compare（基线间对比）本版不跑约束检查（D10）。
 
 ## 自定义解析器插件（v0.5.0）
 

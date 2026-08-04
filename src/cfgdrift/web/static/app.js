@@ -42,9 +42,20 @@ function locationCell(it) {
   return file + maskedBadge(it);
 }
 
+function constraintCell(it) {
+  // v0.6.0: render consistency-constraint violations as badges + messages.
+  const violations = (it && it.constraint_violations) || [];
+  if (!violations.length) return "-";
+  return violations.map((v) =>
+    '<div class="cv"><span class="cv-id">' + esc(v.constraint_id || "?") + "</span>" +
+    '<span class="cv-type">[' + esc(v.type || "?") + "]</span>" +
+    esc(v.message || "") + "</div>"
+  ).join("");
+}
+
 function itemRows(items) {
   if (!items || !items.length) {
-    return '<tr><td colspan="8" class="muted">无漂移项</td></tr>';
+    return '<tr><td colspan="9" class="muted">无漂移项</td></tr>';
   }
   return items.map((it) => {
     const sev = it.severity || "NONE";
@@ -58,6 +69,7 @@ function itemRows(items) {
       "<td>" + esc(JSON.stringify(it.old_value)) + "</td>" +
       "<td>" + esc(JSON.stringify(it.new_value)) + "</td>" +
       "<td>" + esc(it.rule_id == null ? "-" : "#" + it.rule_id) + "</td>" +
+      "<td>" + constraintCell(it) + "</td>" +
       "</tr>"
     );
   }).join("");
@@ -250,7 +262,7 @@ async function loadReport() {
   $("#reportBody").innerHTML =
     "<p class=\"muted\">#" + data.scan_id + " · " + fmtTime(data.created_at) + " · mode=" + data.mode +
     (data.baseline ? " · baseline=" + data.baseline.name + " v" + data.baseline.version : "") + "</p>" +
-    '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th></tr></thead>' +
+    '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th><th>约束违反</th></tr></thead>' +
     "<tbody>" + itemRows(items) + "</tbody></table>";
 }
 
@@ -395,7 +407,7 @@ function renderCompareResult(data, sev) {
     stat("类型变化", s.type_changed || 0, "critical") +
     "</div>" +
     '<div class="card">' + bars + "</div>" +
-    '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th></tr></thead>' +
+    '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th><th>约束违反</th></tr></thead>' +
     "<tbody>" + itemRows(items) + "</tbody></table>";
 }
 

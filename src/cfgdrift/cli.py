@@ -22,12 +22,17 @@ from .alert.state import AlertStateStore
 from .core.compare import CompareEngine
 from .core.differ import SemanticDiffer
 from .core.masker import SensitiveMasker, masking_config_path
-from .core.model import IgnoreRule, Report, ScanSummary, Severity
+from .core.model import Constraint, IgnoreRule, Report, ScanSummary, Severity
 from .core.parser import parse_file, validate_format
 from .core.reporter import Reporter
 from .daemon.autostart import AutostartManager
 from .daemon.daemon import DaemonManager
 from .daemon.worker import main as worker_main
+from .rules.constraints import (
+    ConstraintConfig,
+    default_path as constraints_config_path,
+    resolve as resolve_constraints,
+)
 from .rules.ignore import make_rule
 from .rules.severity import SeverityConfig, default_path as severity_config_path
 from .rules.severity import make_rule as make_severity_rule
@@ -90,6 +95,17 @@ def _load_severity_rules() -> List[Any]:
     return SeverityConfig.load(path)
 
 
+def _load_constraints(
+    extra_paths: Optional[List[str]] = None,
+    builtin_enabled: bool = True,
+) -> List[Constraint]:
+    """Resolve the effective constraints for diff/scan (D8)."""
+    return resolve_constraints(
+        _daemon_home(), extra_paths=list(extra_paths or []),
+        builtin_enabled=builtin_enabled,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level group
 # ---------------------------------------------------------------------------
@@ -139,6 +155,7 @@ def _perform_scan(
     description: str = "",
     no_line: bool = False,
     masker: Optional[SensitiveMasker] = None,
+    constraints: Optional[List[Constraint]] = None,
 ) -> int:
     store = _open_store(ctx)
     snapshot, line_maps = _SCANNER.scan_path_with_lines(path, fmt)
@@ -172,6 +189,7 @@ def _perform_scan(
             severity_rules=severity_rules,
             old_lines=baseline.line_maps,
             new_lines=line_maps,
+            constraints=constraints,
         )
 
     report = Report(
@@ -233,6 +251,11 @@ def _use_color(ctx: click.Context) -> bool:
     help="Extra sensitive key stems to mask (append; default list is always active).",
 )
 @click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
+@click.option("--builtin/--no-builtin", "builtin", default=True,
+              help="Enable the built-in constraint library (v0.6.0; default: on).")
+@click.option("--constraints", "constraint_files", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Extra constraints.yaml file (repeatable; v0.6.0).")
 @click.pass_context
 def scan(
     ctx: click.Context,
@@ -245,11 +268,14 @@ def scan(
     description: str,
     sensitive_keys: tuple,
     no_line: bool,
+    builtin: bool,
+    constraint_files: tuple,
 ) -> int:
     """Scan a file or directory and (optionally) compare against a baseline."""
     if interval <= 0:
         raise ValueError("--interval must be a positive integer")
     masker = _build_masker(list(sensitive_keys))
+    constraints = _load_constraints(list(constraint_files), builtin)
 
     def on_scan(snapshot: Dict[str, object]) -> None:
         _perform_scan(
@@ -262,6 +288,7 @@ def scan(
             description=description,
             no_line=no_line,
             masker=masker,
+            constraints=constraints,
         )
 
     if watch:
@@ -273,6 +300,7 @@ def scan(
     return _perform_scan(
         ctx, path, fmt, baseline_name, save_as_baseline, mode="manual",
         description=description, no_line=no_line, masker=masker,
+        constraints=constraints,
     )
 
 
@@ -472,10 +500,16 @@ def _run_compare(
     help="Extra sensitive key stems to mask (append; default list is always active).",
 )
 @click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
+@click.option("--builtin/--no-builtin", "builtin", default=True,
+              help="Enable the built-in constraint library (v0.6.0; default: on).")
+@click.option("--constraints", "constraint_files", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Extra constraints.yaml file (repeatable; v0.6.0).")
 @click.pass_context
 def diff(ctx: click.Context, path: Optional[str], baseline_name: Optional[str],
          fmt: str, color: bool, compare_mode: bool, env1: Optional[str],
-         env2: Optional[str], sensitive_keys: tuple, no_line: bool) -> int:
+         env2: Optional[str], sensitive_keys: tuple, no_line: bool,
+         builtin: bool, constraint_files: tuple) -> int:
     """Diff a file/directory against a baseline and print the drift report.
 
     ``--compare`` is a v0.4.0 alias for ``cfgdrift compare ENV1 ENV2``.
@@ -490,9 +524,10 @@ def diff(ctx: click.Context, path: Optional[str], baseline_name: Optional[str],
     if not path:
         raise ValueError("path is required (unless --compare)")
     masker = _build_masker(list(sensitive_keys))
+    constraints = _load_constraints(list(constraint_files), builtin)
     return _perform_scan(
         ctx, path, fmt, baseline_name, None, mode="manual",
-        no_line=no_line, masker=masker,
+        no_line=no_line, masker=masker, constraints=constraints,
     )
 
 
@@ -623,6 +658,7 @@ def _item_from_dict(d: Dict[str, Any]):
         rule_id=d.get("rule_id"),
         line=d.get("line"),
         masked=bool(d.get("masked", False)),
+        constraint_violations=list(d.get("constraint_violations", []) or []),
     )
 
 
@@ -820,6 +856,124 @@ def severity_disable(ctx: click.Context, name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# constraint group (v0.6.0)
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def constraint() -> None:
+    """Manage consistency constraints (constraints.yaml + built-in library)."""
+
+
+def _constraint_source_options(source: str, show_all: bool) -> List[Constraint]:
+    """Return the constraints to list for ``--source builtin|user|all``.
+
+    ``all`` (the default view) shows the *effective* set: built-in library
+    merged with user rules, later (user) entries overriding same-id built-ins
+    (D8).  ``builtin`` lists only the built-in library; ``user`` only the
+    constraints.yaml entries.
+    """
+    if source == "builtin":
+        from .core.constraints import BUILTIN_CONSTRAINTS
+
+        return list(BUILTIN_CONSTRAINTS)
+    if source == "user":
+        return ConstraintConfig.list_rules(constraints_config_path(_daemon_home()))
+    return _load_constraints()
+
+
+@constraint.command("add")
+@click.option("--rule", "rule_json", required=True,
+              help="Constraint as a JSON string (id/type/message/...; v0.6.0).")
+@click.option("--disable", "disable", is_flag=True,
+              help="Create the constraint disabled (default: enabled).")
+@click.pass_context
+def constraint_add(ctx: click.Context, rule_json: str, disable: bool) -> int:
+    """Add a user constraint to <home>/constraints.yaml."""
+    try:
+        data = json.loads(rule_json)
+    except ValueError as exc:
+        raise ValueError("invalid --rule JSON: %s" % exc) from exc
+    if not isinstance(data, dict):
+        raise ValueError("--rule must be a JSON object")
+    constraint_obj = Constraint.from_dict(data, source="user")
+    if disable:
+        constraint_obj.enabled = False
+    path = constraints_config_path(_daemon_home())
+    ConstraintConfig.add_rule(path, constraint_obj)
+    click.echo(
+        "constraint %r added (type=%s severity=%s%s)"
+        % (
+            constraint_obj.id,
+            constraint_obj.type,
+            constraint_obj.severity.value,
+            "" if not disable else ", disabled",
+        )
+    )
+    return 0
+
+
+@constraint.command("list")
+@click.option("--source", "source", default="all",
+              type=click.Choice(["builtin", "user", "all"]),
+              help="Filter by source (default: all = effective view).")
+@click.option("--all", "show_all", is_flag=True,
+              help="Explicitly show every rule (disabled ones are always "
+                   "listed with their enabled flag).")
+@click.pass_context
+def constraint_list(ctx: click.Context, source: str, show_all: bool) -> int:
+    """List consistency constraints (id / type / severity / enabled / source)."""
+    rules = _constraint_source_options(source, show_all)
+    if not rules:
+        click.echo("no constraints")
+        return 0
+    for r in rules:
+        click.echo(
+            "# %s type=%s severity=%s enabled=%s source=%s"
+            % (
+                r.id,
+                r.type,
+                r.severity.value,
+                "yes" if r.enabled else "no",
+                r.source,
+            )
+        )
+    return 0
+
+
+@constraint.command("remove")
+@click.argument("constraint_id")
+@click.pass_context
+def constraint_remove(ctx: click.Context, constraint_id: str) -> int:
+    """Remove a user constraint by id."""
+    path = constraints_config_path(_daemon_home())
+    ConstraintConfig.remove_rule(path, constraint_id)
+    click.echo("constraint %r removed" % constraint_id)
+    return 0
+
+
+@constraint.command("enable")
+@click.argument("constraint_id")
+@click.pass_context
+def constraint_enable(ctx: click.Context, constraint_id: str) -> int:
+    """Enable a user constraint by id."""
+    path = constraints_config_path(_daemon_home())
+    ConstraintConfig.set_enabled(path, constraint_id, True)
+    click.echo("constraint %r enabled" % constraint_id)
+    return 0
+
+
+@constraint.command("disable")
+@click.argument("constraint_id")
+@click.pass_context
+def constraint_disable(ctx: click.Context, constraint_id: str) -> int:
+    """Disable a user constraint by id."""
+    path = constraints_config_path(_daemon_home())
+    ConstraintConfig.set_enabled(path, constraint_id, False)
+    click.echo("constraint %r disabled" % constraint_id)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # serve
 # ---------------------------------------------------------------------------
 
@@ -871,6 +1025,11 @@ def daemon() -> None:
               type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"]))
 @click.option("--foreground", is_flag=True,
               help="Run in the foreground (development/CI; Ctrl+C stops).")
+@click.option("--builtin/--no-builtin", "builtin", default=True,
+              help="Enable the built-in constraint library (v0.6.0; default: on).")
+@click.option("--constraints", "constraint_files", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Extra constraints.yaml file (repeatable; v0.6.0).")
 @click.pass_context
 def daemon_start(
     ctx: click.Context,
@@ -881,6 +1040,8 @@ def daemon_start(
     log_file: Optional[str],
     log_level: str,
     foreground: bool,
+    builtin: bool,
+    constraint_files: tuple,
 ) -> int:
     """Start the daemon (background by default)."""
     if interval <= 0:
@@ -925,6 +1086,10 @@ def daemon_start(
             "--alert-state", os.path.join(home, "alert_state.json"),
             "--foreground",
         ]
+        if not builtin:
+            argv += ["--no-builtin"]
+        for extra in constraint_files:
+            argv += ["--constraints", extra]
         for target in targets:
             argv += ["--path", target]
         try:
@@ -943,6 +1108,8 @@ def daemon_start(
         "log_file": log_file or manager.log_file,
         "alerts_config": AlertConfig.default_path(home),
         "alert_state": os.path.join(home, "alert_state.json"),
+        "builtin": builtin,
+        "constraint_paths": list(constraint_files),
     }
     return manager.start(opts)
 

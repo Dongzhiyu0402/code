@@ -359,17 +359,29 @@ def build_drift_payload(
     severity = report.summary.max_severity
     items = []
     for item in report.items:
-        items.append(
-            {
-                "key": item.key_path,
-                "baseline": to_jsonable(item.old_value),
-                "current": to_jsonable(item.new_value),
-                "severity": item.severity.value,
-                "file": item.file,
-                "change_type": item.change_type.value,
-                "masked": bool(getattr(item, "masked", False)),
+        entry = {
+            "key": item.key_path,
+            "baseline": to_jsonable(item.old_value),
+            "current": to_jsonable(item.new_value),
+            "severity": item.severity.value,
+            "file": item.file,
+            "change_type": item.change_type.value,
+            "masked": bool(getattr(item, "masked", False)),
+        }
+        # v0.6.0: attach the first constraint violation (deterministic by
+        # constraint_id) when the item carries any.
+        violations = getattr(item, "constraint_violations", None) or []
+        if violations:
+            first = sorted(
+                violations, key=lambda v: str(v.get("constraint_id", ""))
+            )[0]
+            entry["constraint"] = {
+                "id": first.get("constraint_id"),
+                "type": first.get("type"),
+                "message": first.get("message"),
+                "involved_keys": list(first.get("involved_keys") or []),
             }
-        )
+        items.append(entry)
     count = len(items)
     payload: Dict[str, Any] = {
         "event": "cfgdrift.drift",

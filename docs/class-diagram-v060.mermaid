@@ -1,0 +1,70 @@
+classDiagram
+    class Constraint {
+        +str id
+        +str type
+        +str message
+        +Severity severity
+        +bool enabled
+        +str source
+        +List~str~ keys
+        +Optional~float~ min
+        +Optional~float~ max
+        +Optional~list~ allowed
+        +Optional~dict~ when
+        +Optional~any~ then
+        +Optional~list~ forbid
+        +__post_init__() None
+        +to_dict() dict
+        +from_dict(data: dict, source: str) Constraint
+    }
+    class ConstraintViolation {
+        +str constraint_id
+        +str type
+        +str message
+        +List~str~ involved_keys
+        +to_dict() dict
+    }
+    class DriftItem {
+        +str key_path
+        +ChangeType change_type
+        +Severity severity
+        +str file
+        +list constraint_violations
+        +to_dict() dict
+    }
+    class ConstraintEngine {
+        +check_one(constraint: Constraint, tree: dict) List~ConstraintViolation~
+        +apply(new_snapshot: dict, items: List~DriftItem~, constraints: List~Constraint~) None
+        +_upgrade(item: DriftItem, constraints_by_id: dict) None
+    }
+    class ConstraintConfig {
+        +load(path: str) List~Constraint~
+        +save(path: str, constraints: List~Constraint~) None
+        +add_rule(path: str, constraint: Constraint) int
+        +remove_rule(path: str, constraint_id: str) None
+        +set_enabled(path: str, constraint_id: str, enabled: bool) None
+        +list_rules(path: str) List~Constraint~
+    }
+    class SemanticDiffer {
+        +diff(old, new, file, rules, severity_rules, old_lines, new_lines, constraints) tuple
+        +diff_snapshot(old_snapshot, new_snapshot, rules, severity_rules, old_lines, new_lines, constraints) tuple
+        +_finish(items, rules, severity_rules, old_lines, new_lines, new_tree, constraints) tuple
+    }
+    class Reporter {
+        +render_terminal(report, color, masker, show_line) str
+    }
+    class HtmlReporter {
+        +_items_table(items: list) str
+    }
+    class AlertPayload {
+        +build_drift_payload(report, baseline_name, target, version, masker) dict
+    }
+
+    ConstraintEngine ..> Constraint : 读取/校验
+    ConstraintEngine ..> ConstraintViolation : 生成
+    DriftItem "1" o-- "0..*" ConstraintViolation : constraint_violations
+    SemanticDiffer ..> ConstraintEngine : apply_constraints(new_tree, items, constraints)
+    ConstraintConfig ..> Constraint : from_dict/to_dict
+    Reporter ..> DriftItem : 读取 constraint_violations
+    HtmlReporter ..> DriftItem : 读取 constraint_violations
+    AlertPayload ..> DriftItem : 读取 constraint_violations → constraint 字段

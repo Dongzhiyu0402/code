@@ -184,9 +184,13 @@ class DriftItem:
     # v0.4.0: True when a display exit masked the values (raw values stay in
     # the database; masking is applied only at the four display exits).
     masked: bool = False
+    # v0.6.0: constraint violations attached by the consistency engine.  Each
+    # element is a ``ConstraintViolation.to_dict()`` shaped dict.  It is only
+    # emitted by ``to_dict`` when non-empty (zero-noise contract D7).
+    constraint_violations: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "key_path": self.key_path,
             "change_type": self.change_type.value,
             "severity": self.severity.value,
@@ -199,6 +203,11 @@ class DriftItem:
             "line": self.line,
             "masked": self.masked,
         }
+        if self.constraint_violations:
+            out["constraint_violations"] = [
+                dict(v) for v in self.constraint_violations
+            ]
+        return out
 
 
 @dataclass
@@ -462,10 +471,307 @@ class SeverityRule:
         )
 
 
+# ---------------------------------------------------------------------------
+# Consistency constraints (v0.6.0)
+# ---------------------------------------------------------------------------
+
+CONSTRAINT_TYPES = (
+    "range",
+    "enum",
+    "conditional_required",
+    "correlation",
+    "mutual_exclusion",
+)
+
+_CORRELATION_OPS = (">=", ">", "<=", "<", "==", "!=")
+
+
+def _is_number(value: Any) -> bool:
+    """Return True for int/float values (bool excluded: bool is an int)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _check_when(when: Any, constraint_id: str) -> None:
+    """Validate the shared ``when`` field for conditional/correlation types."""
+    if not isinstance(when, dict):
+        raise ValueError(
+            "constraint %r 'when' must be a mapping {key, value}" % constraint_id
+        )
+    key = when.get("key")
+    if not key or not isinstance(key, str):
+        raise ValueError(
+            "constraint %r 'when.key' must be a non-empty string" % constraint_id
+        )
+    if "value" not in when:
+        raise ValueError(
+            "constraint %r 'when' must include a 'value'" % constraint_id
+        )
+
+
+@dataclass
+class Constraint:
+    """One consistency constraint (v0.6.0).
+
+    ``type`` is one of ``range`` / ``enum`` / ``conditional_required`` /
+    ``correlation`` / ``mutual_exclusion`` (see :data:`CONSTRAINT_TYPES`).
+    Field meaning depends on the type:
+
+    - ``range``: ``keys`` has exactly one dotted path; ``min`` / ``max``
+      (at least one) bound the numeric value.
+    - ``enum``: ``keys`` has exactly one dotted path; ``allowed`` lists the
+      permitted values.
+    - ``conditional_required``: ``when`` = ``{"key", "value"}``;
+      ``then`` = ``{"require": [path, ...]}`` (all must exist).
+    - ``correlation``: ``when`` = ``{"key", "value"}``; ``then`` is a single
+      ``{"key", "op", "value"}`` or a list of them (normalized to a list);
+      ``op`` ∈ ``>=,>,<=,<,==,!=``.
+    - ``mutual_exclusion``: ``keys`` has at least two paths; optional
+      ``forbid`` lists ``[v1, v2]`` pairs (default: any two keys coexisting
+      is a conflict).
+
+    ``source`` is ``"builtin"`` (built-in library) or ``"user"``
+    (``<home>/constraints.yaml`` / ``--constraints`` files).  A corrupt
+    constraint raises ``ValueError`` at construction time (the CLI surfaces
+    it as exit code 2).
+    """
+
+    id: str
+    type: str
+    message: str
+    severity: Severity = Severity.WARN
+    enabled: bool = True
+    source: str = "builtin"  # "builtin" | "user"
+    keys: List[str] = field(default_factory=list)
+    min: Optional[float] = None
+    max: Optional[float] = None
+    allowed: Optional[List[Any]] = None
+    when: Optional[dict] = None
+    then: Optional[Any] = None
+    forbid: Optional[List[list]] = None
+
+    def __post_init__(self) -> None:
+        if not self.id or not isinstance(self.id, str):
+            raise ValueError("constraint id must be a non-empty string")
+        if self.type not in CONSTRAINT_TYPES:
+            raise ValueError(
+                "constraint %r has invalid type %r (expected one of: %s)"
+                % (self.id, self.type, ", ".join(CONSTRAINT_TYPES))
+            )
+        if not self.message or not isinstance(self.message, str):
+            raise ValueError(
+                "constraint %r is missing a non-empty 'message'" % self.id
+            )
+        if not isinstance(self.severity, Severity):
+            self.severity = Severity(str(self.severity).upper())
+        if self.source not in ("builtin", "user"):
+            raise ValueError(
+                "constraint %r has invalid source %r (expected builtin or user)"
+                % (self.id, self.source)
+            )
+        if self.keys is None:
+            self.keys = []
+        else:
+            self.keys = list(self.keys)
+
+        if self.type == "range":
+            if len(self.keys) != 1:
+                raise ValueError(
+                    "range constraint %r requires exactly one key" % self.id
+                )
+            if self.min is None and self.max is None:
+                raise ValueError(
+                    "range constraint %r requires 'min' and/or 'max'" % self.id
+                )
+            for bound in (self.min, self.max):
+                if bound is not None and not _is_number(bound):
+                    raise ValueError(
+                        "range constraint %r min/max must be numbers" % self.id
+                    )
+        elif self.type == "enum":
+            if len(self.keys) != 1:
+                raise ValueError(
+                    "enum constraint %r requires exactly one key" % self.id
+                )
+            if not isinstance(self.allowed, list) or not self.allowed:
+                raise ValueError(
+                    "enum constraint %r requires a non-empty 'allowed' list"
+                    % self.id
+                )
+        elif self.type == "conditional_required":
+            _check_when(self.when, self.id)
+            then = self.then
+            if not isinstance(then, dict):
+                raise ValueError(
+                    "conditional_required constraint %r 'then' must be a "
+                    "mapping {require: [...]}" % self.id
+                )
+            require = then.get("require")
+            if not isinstance(require, list) or not require:
+                raise ValueError(
+                    "conditional_required constraint %r 'then.require' must "
+                    "be a non-empty list" % self.id
+                )
+            for req in require:
+                if not req or not isinstance(req, str):
+                    raise ValueError(
+                        "conditional_required constraint %r 'then.require' "
+                        "entries must be non-empty strings" % self.id
+                    )
+        elif self.type == "correlation":
+            _check_when(self.when, self.id)
+            raw = self.then
+            items = raw if isinstance(raw, list) else [raw]
+            if not items:
+                raise ValueError(
+                    "correlation constraint %r 'then' must not be empty"
+                    % self.id
+                )
+            normalized = []
+            for cond in items:
+                if not isinstance(cond, dict):
+                    raise ValueError(
+                        "correlation constraint %r 'then' entries must be "
+                        "mappings {key, op, value}" % self.id
+                    )
+                ckey = cond.get("key")
+                op = cond.get("op")
+                if not ckey or not isinstance(ckey, str):
+                    raise ValueError(
+                        "correlation constraint %r 'then.key' must be a "
+                        "non-empty string" % self.id
+                    )
+                if op not in _CORRELATION_OPS:
+                    raise ValueError(
+                        "correlation constraint %r has invalid op %r "
+                        "(expected one of: %s)"
+                        % (self.id, op, ", ".join(_CORRELATION_OPS))
+                    )
+                if "value" not in cond:
+                    raise ValueError(
+                        "correlation constraint %r 'then.value' is required"
+                        % self.id
+                    )
+                normalized.append(
+                    {"key": ckey, "op": op, "value": cond.get("value")}
+                )
+            self.then = normalized
+        elif self.type == "mutual_exclusion":
+            if len(self.keys) < 2:
+                raise ValueError(
+                    "mutual_exclusion constraint %r requires at least two keys"
+                    % self.id
+                )
+            if self.forbid is not None:
+                if not isinstance(self.forbid, list):
+                    raise ValueError(
+                        "mutual_exclusion constraint %r 'forbid' must be a "
+                        "list of [v1, v2] pairs" % self.id
+                    )
+                normalized = []
+                for pair in self.forbid:
+                    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                        raise ValueError(
+                            "mutual_exclusion constraint %r 'forbid' entries "
+                            "must be [v1, v2] pairs" % self.id
+                        )
+                    normalized.append(list(pair))
+                self.forbid = normalized
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "message": self.message,
+            "severity": self.severity.value,
+            "enabled": self.enabled,
+            "source": self.source,
+            "keys": list(self.keys),
+            "min": self.min,
+            "max": self.max,
+            "allowed": list(self.allowed) if self.allowed is not None else None,
+            "when": self.when,
+            "then": self.then,
+            "forbid": (
+                [list(p) for p in self.forbid] if self.forbid is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, source: str = "user") -> "Constraint":
+        """Build a validated constraint from a raw YAML/JSON entry.
+
+        ``source`` defaults to ``"user"`` (constraints.yaml / --constraints);
+        the built-in library passes ``source="builtin"``.  Missing or corrupt
+        fields raise ``ValueError``.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("constraint must be a mapping")
+        cid = data.get("id")
+        ctype = data.get("type")
+        message = data.get("message")
+        if not cid or not isinstance(cid, str):
+            raise ValueError("constraint is missing a non-empty 'id'")
+        if ctype not in CONSTRAINT_TYPES:
+            raise ValueError(
+                "constraint %r has invalid type %r (expected one of: %s)"
+                % (cid, ctype, ", ".join(CONSTRAINT_TYPES))
+            )
+        if not message or not isinstance(message, str):
+            raise ValueError(
+                "constraint %r is missing a non-empty 'message'" % cid
+            )
+        try:
+            severity = Severity(str(data.get("severity", "WARN")).upper())
+        except ValueError:
+            raise ValueError(
+                "constraint %r has invalid severity %r"
+                % (cid, data.get("severity"))
+            ) from None
+        if source not in ("builtin", "user"):
+            raise ValueError(
+                "constraint %r has invalid source %r" % (cid, source)
+            )
+        raw_keys = data.get("keys") or []
+        if not isinstance(raw_keys, list):
+            raise ValueError("constraint %r 'keys' must be a list" % cid)
+        return cls(
+            id=cid,
+            type=ctype,
+            message=message,
+            severity=severity,
+            enabled=bool(data.get("enabled", True)),
+            source=source,
+            keys=[str(k) for k in raw_keys],
+            min=data.get("min"),
+            max=data.get("max"),
+            allowed=data.get("allowed"),
+            when=data.get("when"),
+            then=data.get("then"),
+            forbid=data.get("forbid"),
+        )
+
+
+@dataclass
+class ConstraintViolation:
+    """One constraint break attached to a :class:`DriftItem` (v0.6.0)."""
+
+    constraint_id: str
+    type: str
+    message: str
+    involved_keys: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "constraint_id": self.constraint_id,
+            "type": self.type,
+            "message": self.message,
+            "involved_keys": list(self.involved_keys),
+        }
+
+
 @dataclass
 class CompareReport:
     """Result of comparing one environment's baseline against a reference."""
-
     baseline_a: str  # reference environment/baseline
     baseline_b: str  # compared environment/baseline
     created_at: str

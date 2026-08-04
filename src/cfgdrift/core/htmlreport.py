@@ -137,6 +137,11 @@ class HtmlReporter:
   .masked-badge {{ display: inline-block; padding: 1px 6px; border-radius: 6px;
     font-size: 10px; background: rgba(56,189,248,.15); color: var(--accent);
     margin-left: 4px; }}
+  .cv {{ margin-bottom: 4px; font-size: 12px; line-height: 1.5; }}
+  .cv-id {{ display: inline-block; padding: 1px 6px; border-radius: 6px;
+    font-size: 10px; background: rgba(239,68,68,.15); color: var(--critical);
+    margin-right: 6px; font-weight: 600; }}
+  .cv-type {{ color: var(--muted); margin-right: 4px; }}
   .bar-row {{ display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }}
   .bar-label {{ width: 90px; font-size: 13px; color: var(--muted); }}
   .bar-track {{ flex: 1; background: var(--panel-2); border-radius: 8px;
@@ -170,7 +175,7 @@ class HtmlReporter:
   </div>
   <table id="itemsTable">
     <thead><tr><th>严重度</th><th>键路径</th><th>变更类型</th>
-      <th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th></tr></thead>
+      <th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th><th>约束违反</th></tr></thead>
     <tbody>{table_html}</tbody>
   </table>
 </div>
@@ -273,7 +278,7 @@ class HtmlReporter:
     def _items_table(items: List[dict]) -> str:
         """Render the item rows (severity / key / type / file:line / values)."""
         if not items:
-            return '<tr><td colspan="7" class="muted">无漂移项</td></tr>'
+            return '<tr><td colspan="8" class="muted">无漂移项</td></tr>'
         rows = []
         for item in items or []:
             sev = str(item.get("severity", "NONE") or "NONE").upper()
@@ -293,12 +298,29 @@ class HtmlReporter:
             new_value = _esc(_fmt_value(item.get("new_value")))
             rule_id = item.get("rule_id")
             rule_text = "#%s" % rule_id if rule_id is not None else "-"
+            violations = item.get("constraint_violations") or []
+            if violations:
+                cv_cells = []
+                for violation in violations:
+                    cv_cells.append(
+                        '<div class="cv"><span class="cv-id">%s</span>'
+                        '<span class="cv-type">[%s]</span>%s</div>'
+                        % (
+                            _esc(violation.get("constraint_id", "?")),
+                            _esc(violation.get("type", "?")),
+                            _esc(violation.get("message", "")),
+                        )
+                    )
+                cv_html = "".join(cv_cells)
+            else:
+                cv_html = "-"
             rows.append(
                 '<tr data-sev="%s">'
                 '<td><span class="badge b-%s">%s</span></td>'
                 "<td>%s</td>"
                 "<td>%s</td>"
                 "<td>%s%s</td>"
+                "<td>%s</td>"
                 "<td>%s</td>"
                 "<td>%s</td>"
                 "<td>%s</td>"
@@ -314,6 +336,7 @@ class HtmlReporter:
                     old_value,
                     new_value,
                     _esc(rule_text),
+                    cv_html,
                 )
             )
         return "".join(rows)

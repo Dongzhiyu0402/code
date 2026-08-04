@@ -14,6 +14,7 @@ from .model import (
     join_path,
     type_name,
 )
+from .constraints import apply_constraints
 
 
 class SeverityEngine:
@@ -48,6 +49,7 @@ class SemanticDiffer:
         severity_rules: Optional[List[SeverityRule]] = None,
         old_lines: Optional[Dict[str, Dict[str, int]]] = None,
         new_lines: Optional[Dict[str, Dict[str, int]]] = None,
+        constraints: Optional[List[Any]] = None,  # v0.6.0
     ) -> Tuple[List[DriftItem], ScanSummary]:
         """Diff two semantic trees for a single file.
 
@@ -55,12 +57,23 @@ class SemanticDiffer:
         in the resulting items.  ``severity_rules`` (v0.4.0) override the
         built-in severity classification with first-match-wins before the
         summary is computed; ``old_lines`` / ``new_lines`` attach 1-based
-        source lines to each item (new side preferred).  Returns
-        ``(items, summary)``.
+        source lines to each item (new side preferred).  ``constraints``
+        (v0.6.0, optional) is a list of consistency constraints evaluated
+        against the *new* tree after severity overrides; violations upgrade
+        the affected items' severities (see :mod:`cfgdrift.core.constraints`).
+        Returns ``(items, summary)``.
         """
         items: List[DriftItem] = []
         self._diff_node(old, new, [], file, items)
-        return self._finish(items, rules, severity_rules, old_lines, new_lines)
+        return self._finish(
+            items,
+            rules,
+            severity_rules,
+            old_lines,
+            new_lines,
+            new_tree={file: new} if file else {"": new},
+            constraints=constraints,
+        )
 
     def diff_snapshot(
         self,
@@ -70,13 +83,16 @@ class SemanticDiffer:
         severity_rules: Optional[List[SeverityRule]] = None,
         old_lines: Optional[Dict[str, Dict[str, int]]] = None,
         new_lines: Optional[Dict[str, Dict[str, int]]] = None,
+        constraints: Optional[List[Any]] = None,  # v0.6.0
     ) -> Tuple[List[DriftItem], ScanSummary]:
         """Diff two snapshots ``{relpath: tree}``.
 
         Handles per-file key-level drift for files present in both snapshots
         and file-level drift (added/removed files) for files present in only
         one snapshot.  ``severity_rules`` / ``old_lines`` / ``new_lines`` are
-        the v0.4.0 extensions described in :meth:`diff`.
+        the v0.4.0 extensions described in :meth:`diff`; ``constraints``
+        (v0.6.0, optional) is evaluated per file against the new snapshot
+        tree.
         """
         items: List[DriftItem] = []
         old_files = set(old_snapshot.keys())
@@ -112,7 +128,15 @@ class SemanticDiffer:
                     new_type="dict",
                 )
             )
-        return self._finish(items, rules, severity_rules, old_lines, new_lines)
+        return self._finish(
+            items,
+            rules,
+            severity_rules,
+            old_lines,
+            new_lines,
+            new_tree=new_snapshot,
+            constraints=constraints,
+        )
 
     # -- internals ---------------------------------------------------------
 
@@ -232,15 +256,22 @@ class SemanticDiffer:
         severity_rules: Optional[List[SeverityRule]] = None,
         old_lines: Optional[Dict[str, Dict[str, int]]] = None,
         new_lines: Optional[Dict[str, Dict[str, int]]] = None,
+        new_tree: Optional[Dict[str, Any]] = None,  # v0.6.0
+        constraints: Optional[List[Any]] = None,  # v0.6.0
     ) -> Tuple[List[DriftItem], ScanSummary]:
-        """Post-process: severity override -> ignore filter -> lines -> summary.
+        """Post-process: severity override -> constraints -> ignore -> summary.
 
         The custom severity rules run *before* the ignore filter so that
         ``summary.max_severity`` is computed over the overridden severities
         (v0.4.0 decision: alert thresholds keep working with zero changes).
-        Line numbers are attached to the final kept items only.
+        v0.6.0: consistency constraints are applied after severity overrides
+        (C-06: override first, then upgrade) and before ignore filtering —
+        ignored items carry their violations out of the output.  Line numbers
+        are attached to the final kept items only.
         """
         self._apply_custom_severity(items, severity_rules)
+        if constraints:
+            apply_constraints(new_tree, items, constraints)
         kept, summary = self._finalize(items, rules)
         self._attach_lines(kept, old_lines, new_lines)
         return kept, summary
