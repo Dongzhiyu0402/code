@@ -156,17 +156,50 @@ cfgdrift report --scan-id 3 --html out.html   # 单文件离线 HTML，可直接
 
 ## 自定义解析器插件（v0.5.0）
 
-`--format` 接受内置格式 `auto/json/yaml/toml/ini` 之外，还接受**已注册的插件名**。插件返回
-原始树（dict/list/scalar），由引擎统一归一化为语义树；可选的 `build_line_map` 提供
-`{key_path: line}` 行号映射（未提供则行号为 None，渲染不输出 `:N`）。
+`--format` 除内置 `auto/json/yaml/toml/ini` 外，还接受**已注册的插件名**。
+插件返回**原始树**（dict/list/scalar），由引擎统一归一化为语义树；可选的
+`build_line_map` 提供 `{key_path: 行号}` 行号映射（未提供则行号为
+`None`，diff 渲染不输出 `:N`）。插件 `parse` 抛出的 `ValueError` /
+`RuntimeError` / `OSError` 会被 CLI 捕获为 `error: <消息>` 并以 **exit 2**
+结束，建议错误消息自带 1-based 行号（如 `unbalanced '{' at line 1`）。
 
-### 方式 A：装饰器注册（进程内，import 时生效）
+### 插件协议（真实签名）
+
+```python
+# cfgdrift.core.plugins
+class ParserPlugin:
+    def __init__(self, name: str, extensions: Tuple[str, ...] = (),
+                 parse: Optional[Callable[[str], Any]] = None,
+                 build_line_map: Optional[Callable[[str], Dict[str, int]]] = None): ...
+
+def register_plugin(name: Optional[str] = None, extensions: Tuple[str, ...] = (),
+                    line_map: Optional[Callable[[str], Dict[str, int]]] = None,
+                    registry: Optional[PluginRegistry] = None): ...   # 装饰器
+```
+
+要点：
+
+- `parse(text)` 返回原始树后，引擎走与内置格式**完全相同**的
+  `_normalize` / `_wrap_top_level` 归一化：键转 `str`；顶层非 dict 包装为
+  `{"$": value}`；`datetime/date/time` 转 ISO-8601 字符串；`None` 视作空
+  dict；其余非常规对象转字符串。
+- 行号映射的 **key_path 约定**与内置格式一致（`cfgdrift.core.model.join_path`）：
+  dict 段用 `.` 连接，list 下标追加 `[i]`，含 `.` / `[` / `]` / `\` 的段做
+  反斜杠转义。插件应直接调用 `join_path` 构造 key（见下示例），不要手拼字符串。
+- 未提供 `build_line_map`：`parse_text_lines` 返回空 `{}`，diff 的
+  `item.line` 为 `None`，输出不含 `:N`。`build_line_map` 自身抛异常也会被
+  降级为 warning + 空映射（行号只是增强，永不阻断解析）。
+- `extensions` 必须是小写、带点前缀（如 `(".dsl",)`）；`detect_format` 在
+  内置扩展名之后按插件扩展名兜底识别。
+
+### 方式 A：装饰器注册（进程内，import 即生效）
 
 ```python
 # mydsl_plugin.py
 from cfgdrift.core.plugins import register_plugin
+from cfgdrift.core.model import join_path
 
-def _parse_mydsl(text: str):
+def parse_mydsl(text: str):
     tree = {}
     for line in text.splitlines():
         if "=" in line:
@@ -174,22 +207,32 @@ def _parse_mydsl(text: str):
             tree[k.strip()] = v.strip()
     return tree
 
-def _line_map(text: str):
-    return {k.strip(): i + 1
+def line_map_mydsl(text: str):
+    return {join_path([("key", k.strip())]): i + 1
             for i, line in enumerate(text.splitlines())
             if "=" in line
             for k in [line.split("=", 1)[0]]}
 
-@register_plugin("mydsl", extensions=(".dsl",), line_map=_line_map)
-def parse_mydsl(text: str):
-    return _parse_mydsl(text)
+@register_plugin("mydsl", extensions=(".dsl",), line_map=line_map_mydsl)
+def _registered(text: str):
+    return parse_mydsl(text)
 ```
+
+- 裸 `@register_plugin` 也合法（插件名取函数名）；`registry=reg` 可把插件
+  注册到自定义 `PluginRegistry`（默认注册到全局共享 registry）。
+- 注意：若同名插件已通过 entry point 注册（方式 B 已 `pip install -e` 激活），
+  同一进程内再照抄本示例做装饰器注册会抛
+  `ValueError: parser plugin 'mydsl' is already registered (use replace=True to overwrite)`
+  ——`register_plugin` 内部以 `replace=False` 注册，与 entry point 的
+  `replace=True` 相反。此时可换用不同插件名，或仅依赖 `import mydsl_parser`
+  的 import 副作用（方式 A 的等价注册已随导入完成）。
+- 脚本/测试进程内 import 该模块后即可用：
 
 ```bash
 cfgdrift scan app.dsl --format mydsl        # 扩展名 .dsl 也可自动识别
 ```
 
-### 方式 B：entry point 注册（打包分发，优先于同名装饰器）
+### 方式 B：entry point 注册（pip 打包分发，优先于同名装饰器）
 
 ```toml
 # pyproject.toml（插件包）
@@ -197,16 +240,80 @@ cfgdrift scan app.dsl --format mydsl        # 扩展名 .dsl 也可自动识别
 mydsl = "mydsl_plugin:plugin"
 ```
 
-```python
-# mydsl_plugin.py —— plugin 可以是 ParserPlugin 实例或 (parse_fn, {"extensions":..., "line_map":...})
-from cfgdrift.core.plugins import ParserPlugin
+entry point 值支持四种形态（`_coerce_entry_point` 归一化）：
 
-def parse_mydsl(text: str):
-    return {...}
+1. **`ParserPlugin` 实例**（推荐）：`plugin = ParserPlugin(name="mydsl",
+   extensions=(".dsl",), parse=parse_mydsl, build_line_map=line_map_mydsl)`
+2. `(parse_fn, {"extensions": [...], "line_map": fn})` 元组——注意选项键是
+   `line_map`（不是 `build_line_map`），`name` 缺省取 entry point 名；
+3. 裸 `parse(text)` 函数（插件名取 entry point 名）；
+4. `{"parse": fn, "extensions": [...], "line_map": fn}` 映射。
 
-plugin = ParserPlugin(name="mydsl", extensions=(".dsl",), parse=parse_mydsl,
-                      build_line_map=lambda text: {...})
+同名冲突时 **entry point 覆盖装饰器注册**（`replace=True`）；单个插件加载
+失败仅 warning，不影响内置解析器；发现使用 Python 3.8+ 标准库
+`importlib.metadata`，零新增依赖。
+
+### 完整可运行示例：examples/mydsl-parser
+
+仓库自带一个完整可运行的 nginx-like DSL 插件包
+`examples/mydsl-parser/`（含 pyproject.toml、解析器源码、行号映射、示例配置
+`examples/demo/nginx-like.dsl`、pytest 测试、包内 README）。端到端演示：
+
+```bash
+# 0) 安装示例插件包（entry point 注册；无第三方依赖）
+pip install -e examples/mydsl-parser
+
+# 1) 建基线：显式 --format mydsl（或省略，按 .dsl 扩展名自动识别）
+cfgdrift scan examples/demo/nginx-like.dsl --format mydsl --save-as-baseline mydsl-demo
+
+# 2) 修改配置：把 examples/demo/nginx-like.dsl 第 4 行 listen 8080 改成 8081
+
+# 3) diff：行号精确定位到真实文件行
+cfgdrift diff examples/demo/nginx-like.dsl --baseline mydsl-demo
+# [WARN] server[0].listen (nginx-like.dsl:4): 修改 8080 -> 8081
+# Summary: added=0 removed=0 modified=1 type_changed=0 ignored=0 total=1 max=WARN
 ```
+
+方式 A 的进程内用法（wrapper 脚本，不依赖 entry point）：
+
+```python
+import mydsl_parser                       # import 即通过装饰器注册 "mydsl"
+from cfgdrift.cli import main
+raise SystemExit(main(["scan", "app.dsl", "--format", "mydsl"]))
+```
+
+示例插件的行号映射展示了 `join_path` 约定下的多层嵌套 + 数组下标
+（`server[0].location./api.proxy_pass` → 第 9 行），以及重复 `server` 块自动
+转数组（`server[0]` / `server[1]`）。
+
+### 插件测试示例（pytest）
+
+```python
+# tests/test_my_plugin.py
+from cfgdrift.core import parser as parser_mod
+from cfgdrift.core.plugins import ParserPlugin
+from mydsl_plugin import parse_mydsl, line_map_mydsl   # 方式 A 里的两个函数
+
+PLUGIN = ParserPlugin(
+    name="mydsl", extensions=(".dsl",),
+    parse=parse_mydsl, build_line_map=line_map_mydsl,
+)
+
+def test_dispatch_and_line_map():
+    parser_mod._PLUGIN_REGISTRY.register(PLUGIN, replace=True)
+    try:
+        tree, lm = parser_mod.parse_text_lines("a=1\nb=2", "mydsl")
+        assert tree == {"a": "1", "b": "2"}
+        assert lm == {"a": 1, "b": 2}
+    finally:
+        # 清理共享 registry，避免影响其他用例
+        parser_mod._PLUGIN_REGISTRY._plugins.pop("mydsl", None)
+        parser_mod._PLUGIN_REGISTRY._ext_index.pop(".dsl", None)
+```
+
+完整 17 个用例见 `examples/mydsl-parser/tests/test_mydsl_parser.py`（解析正确性、
+行号映射精确行号、`parse_text`/`parse_text_lines` 分发、diff 行号落位、装饰器与
+entry point 两种注册形态）。
 
 - 未注册的 `--format` 报错包含注册指引（`cfgdrift.parsers` entry point 组 / `register_plugin`）
 - 同名冲突 entry point 覆盖装饰器；单个插件加载失败仅 warning，不影响内置解析器

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel>=0.40"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mydsl-parser"
+version = "0.1.0"
+description = "Example cfgdrift parser plugin: nginx-like DSL (cfgdrift v0.5.0 plugin protocol)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["cfgdrift", "plugin", "parser", "nginx", "dsl"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# No third-party dependencies: only cfgdrift itself (and only at import time).
+dependencies = []
+
+# Entry point group consumed by cfgdrift.core.plugins.discover_entry_points().
+# The value may be a ParserPlugin instance (preferred), a
+# (parse_fn, {"extensions": [...], "line_map": fn}) tuple, a plain callable,
+# or a {"parse": fn, ...} mapping — here we expose a ParserPlugin instance.
+[project.entry-points."cfgdrift.parsers"]
+mydsl = "mydsl_parser:plugin"
+
+[tool.setuptools]
+packages = ["mydsl_parser"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
