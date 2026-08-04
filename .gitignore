@@ -92,3 +92,9 @@ dist-v060/
 _qa8_*.txt
 _qa8_*/
 _qa8_*.py
+_fix_*.txt
+_fix_*/
+.corpus/
+corpus_run/
+dist-v070/
+_dist-v070/
