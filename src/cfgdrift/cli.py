@@ -1146,6 +1146,13 @@ def corpus_init(workspace_dir: str) -> int:
 @click.option("--workspace", "workspace_dir", required=True,
               type=click.Path(exists=True, file_okay=False),
               help="Corpus workspace directory.")
+@click.option("--git-timeout", "git_timeout", type=int, default=None,
+              help="Git subprocess timeout in seconds (default: 120; the "
+                   "CFGDRIFT_GIT_TIMEOUT env var overrides the default and "
+                   "this option overrides the env).")
+@click.option("--retry-failed", "retry_failed", is_flag=True,
+              help="Retry repositories previously marked failed in state.json "
+                   "(default: skip them).")
 @click.option("--builtin/--no-builtin", "builtin", default=True,
               help="Enable the built-in constraint library (default: on).")
 @click.option("--constraints", "constraint_files", multiple=True,
@@ -1154,15 +1161,24 @@ def corpus_init(workspace_dir: str) -> int:
 @click.option("--output", "output", default=None, type=click.Path(),
               help="Output instances.jsonl (default: <workspace>/instances.jsonl).")
 @click.pass_context
-def corpus_fetch(ctx: click.Context, workspace_dir: str, builtin: bool,
-                 constraint_files: tuple, output: Optional[str]) -> int:
+def corpus_fetch(ctx: click.Context, workspace_dir: str, git_timeout: Optional[int],
+                 retry_failed: bool, builtin: bool, constraint_files: tuple,
+                 output: Optional[str]) -> int:
     """Fetch config change pairs from repositories and export the corpus.
 
     ``local_path`` repositories are used directly (offline / CI-safe); other
     repositories are cloned with ``--filter=blob:none`` and updated with
     ``git fetch``.  GitHub star filtering is best-effort (failures warn and
     never block).  ``max_instances`` bounds the corpus (global + per-repo).
+
+    Fetch is **partial-success**: every repository's state is persisted as
+    soon as it is processed, a failed repository is marked with ``"error"``
+    (and skipped on the next run unless ``--retry-failed`` is given), and the
+    command exits 0 when at least one repository succeeded (2 only when every
+    repository failed or was skipped due to a prior error).
     """
+    if git_timeout is not None and git_timeout <= 0:
+        raise ValueError("--git-timeout must be a positive integer")
     ws = CorpusWorkspace(workspace_dir)
     config = CorpusConfig.load(ws.config_path())
     state = ws.read_state()
@@ -1173,60 +1189,94 @@ def corpus_fetch(ctx: click.Context, workspace_dir: str, builtin: bool,
     )
     fetched = 0
     parse_failures = 0
+    succeeded = 0
+    failed = 0
+    skipped_errors = 0
 
     for repo in config.repositories:
         entry = ws.repo_state(state, repo.key)
-        if repo.is_local():
-            source = LocalRepoSource(str(repo.local_path))  # type: ignore[arg-type]
-        else:
-            clone_dir = ws.repo_dir(repo.owner, repo.repo)
-            source = GitCloneSource(repo.owner, repo.repo, clone_dir)
-            if config.min_stars is not None and not entry.get("star_checked"):
-                info = GitHubApi.fetch_repo(
-                    repo.owner, repo.repo, config.effective_token()
-                )
-                if info is not None:
-                    entry["stars"] = info.get("stargazers_count")
-                    entry["star_checked"] = True
-                    stars = entry["stars"]
-                    if stars is not None and stars < config.min_stars:
-                        click.echo(
-                            "skip %s: %s stars < min_stars %s"
-                            % (repo.key, stars, config.min_stars)
-                        )
-                        continue
-                else:
-                    click.echo(
-                        "warning: star check failed for %s (best-effort, "
-                        "continuing)" % repo.key,
-                        err=True,
-                    )
-        source.clone_or_fetch()
-        entry["local_path"] = source.dir
-
-        already = int(entry.get("instance_count", 0) or 0)
-        budget = max(0, per_repo_max - already)
-        if budget <= 0:
-            click.echo("skip %s: per-repo instance cap (%d) reached" % (repo.key, per_repo_max))
+        if entry.get("error") and not retry_failed:
+            click.echo(
+                "skip %s: previously failed (%s); delete the 'error' marker "
+                "in state.json or use --retry-failed"
+                % (repo.key, entry["error"])
+            )
+            skipped_errors += 1
             continue
-        pairs, stats, newest = extractor.extract_repo(
-            source,
-            since=config.effective_since(repo),
-            stop_at=entry.get("last_commit"),
-            max_pairs=budget,
-            glob_pattern=repo.glob,
-        )
-        parse_failures += int(stats.get("parse_failures", 0))
-        if pairs:
-            entry["last_commit"] = newest
-            entry["instance_count"] = already + len(pairs)
-            fetched += len(pairs)
-            click.echo("fetched %d new pair(s) from %s" % (len(pairs), repo.key))
-        else:
-            click.echo("no new pairs from %s" % repo.key)
+        try:
+            if repo.is_local():
+                source = LocalRepoSource(  # type: ignore[arg-type]
+                    str(repo.local_path), git_timeout=git_timeout
+                )
+            else:
+                clone_dir = ws.repo_dir(repo.owner, repo.repo)
+                source = GitCloneSource(
+                    repo.owner, repo.repo, clone_dir, git_timeout=git_timeout
+                )
+                if config.min_stars is not None and not entry.get("star_checked"):
+                    info = GitHubApi.fetch_repo(
+                        repo.owner, repo.repo, config.effective_token()
+                    )
+                    if info is not None:
+                        entry["stars"] = info.get("stargazers_count")
+                        entry["star_checked"] = True
+                        stars = entry["stars"]
+                        if stars is not None and stars < config.min_stars:
+                            click.echo(
+                                "skip %s: %s stars < min_stars %s"
+                                % (repo.key, stars, config.min_stars)
+                            )
+                            succeeded += 1
+                            ws.clear_repo_error(entry)
+                            state["fetched_at"] = utcnow_iso()
+                            ws.write_state(state)
+                            continue
+                    else:
+                        click.echo(
+                            "warning: star check failed for %s (best-effort, "
+                            "continuing)" % repo.key,
+                            err=True,
+                        )
+            source.clone_or_fetch()
+            entry["local_path"] = source.dir
 
-    state["fetched_at"] = utcnow_iso()
-    ws.write_state(state)
+            already = int(entry.get("instance_count", 0) or 0)
+            budget = max(0, per_repo_max - already)
+            if budget <= 0:
+                click.echo(
+                    "skip %s: per-repo instance cap (%d) reached"
+                    % (repo.key, per_repo_max)
+                )
+                succeeded += 1
+                ws.clear_repo_error(entry)
+                state["fetched_at"] = utcnow_iso()
+                ws.write_state(state)
+                continue
+            pairs, stats, newest = extractor.extract_repo(
+                source,
+                since=config.effective_since(repo),
+                stop_at=entry.get("last_commit"),
+                max_pairs=budget,
+                glob_pattern=repo.glob,
+            )
+            parse_failures += int(stats.get("parse_failures", 0))
+            if pairs:
+                entry["last_commit"] = newest
+                entry["instance_count"] = already + len(pairs)
+                fetched += len(pairs)
+                click.echo("fetched %d new pair(s) from %s" % (len(pairs), repo.key))
+            else:
+                click.echo("no new pairs from %s" % repo.key)
+            succeeded += 1
+            ws.clear_repo_error(entry)
+        except (ValueError, RuntimeError, OSError) as exc:
+            failed += 1
+            ws.set_repo_error(state, repo.key, str(exc))
+            click.echo("error fetching %s: %s" % (repo.key, exc), err=True)
+        # Partial-success: persist immediately so a later failure never loses
+        # the progress of repositories processed before it.
+        state["fetched_at"] = utcnow_iso()
+        ws.write_state(state)
 
     constraints = _load_constraints(list(constraint_files), builtin)
     exporter = CorpusExporter()
@@ -1242,6 +1292,14 @@ def corpus_fetch(ctx: click.Context, workspace_dir: str, builtin: bool,
         "parse failures: %d"
         % (parse_failures + int(export_stats.get("parse_failures", 0)))
     )
+    if failed or skipped_errors:
+        click.echo(
+            "fetch summary: %d repo(s) ok, %d failed, %d skipped (error)"
+            % (succeeded, failed, skipped_errors),
+            err=True,
+        )
+    if succeeded == 0 and (failed > 0 or skipped_errors > 0):
+        return 2
     return 0
 
 

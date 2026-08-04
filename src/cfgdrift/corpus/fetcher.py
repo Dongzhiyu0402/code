@@ -23,21 +23,71 @@ import subprocess
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from ..core.parser import parse_text
 from .config import fmt_for_path, is_config_path
 
 logger = logging.getLogger("cfgdrift.corpus.fetcher")
 
+#: Default git subprocess timeout in seconds (overridable per call, by the
+#: ``CFGDRIFT_GIT_TIMEOUT`` env var, or by the ``corpus fetch --git-timeout``
+#: CLI option — CLI > env > default).
+DEFAULT_GIT_TIMEOUT = 120
+
+#: A glob filter is either a single pattern or a list of patterns (OR).
+GlobFilter = Optional[Union[str, List[str]]]
+
+
+def _resolve_git_timeout(timeout: Optional[int] = None) -> int:
+    """Resolve the git subprocess timeout.
+
+    Precedence: explicit ``timeout`` > ``CFGDRIFT_GIT_TIMEOUT`` env > 120.
+    A missing/negative explicit value raises; an invalid env value warns and
+    falls back to the default (never crashes a fetch because of a bad env).
+    """
+    if timeout is not None:
+        resolved = int(timeout)
+        if resolved <= 0:
+            raise ValueError("git timeout must be a positive integer")
+        return resolved
+    raw = os.environ.get("CFGDRIFT_GIT_TIMEOUT", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            logger.warning("ignoring invalid CFGDRIFT_GIT_TIMEOUT=%r", raw)
+        else:
+            if parsed > 0:
+                return parsed
+            logger.warning("ignoring non-positive CFGDRIFT_GIT_TIMEOUT=%r", raw)
+    return DEFAULT_GIT_TIMEOUT
+
+
+def _matches_glob(path: str, glob_pattern: GlobFilter) -> bool:
+    """True when ``path`` matches any of the glob patterns (single string OR
+    list, multi-pattern OR semantics).  None / empty list = no filter."""
+    if glob_pattern is None:
+        return True
+    patterns = [glob_pattern] if isinstance(glob_pattern, str) else list(glob_pattern)
+    if not patterns:
+        return True
+    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
 
 # ---------------------------------------------------------------------------
 # git plumbing
 # ---------------------------------------------------------------------------
 
-def _run_git(directory: str, args: List[str]) -> Tuple[int, str, str]:
-    """Run ``git -C <directory> <args>``; returns ``(code, stdout, stderr)``."""
+def _run_git(directory: str, args: List[str],
+             timeout: Optional[int] = None) -> Tuple[int, str, str]:
+    """Run ``git -C <directory> <args>``; returns ``(code, stdout, stderr)``.
+
+    ``timeout`` is resolved by :func:`_resolve_git_timeout` (explicit >
+    ``CFGDRIFT_GIT_TIMEOUT`` env > 120s).
+    """
     cmd = ["git", "-C", directory] + list(args)
+    resolved_timeout = _resolve_git_timeout(timeout)
     try:
         proc = subprocess.run(
             cmd,
@@ -45,13 +95,16 @@ def _run_git(directory: str, args: List[str]) -> Tuple[int, str, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=120,
+            timeout=resolved_timeout,
             check=False,
         )
     except OSError as exc:
         raise RuntimeError("failed to run git: %s" % exc) from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("git command timed out: %s" % " ".join(cmd)) from exc
+        raise RuntimeError(
+            "git command timed out (timeout=%ss): %s"
+            % (resolved_timeout, " ".join(cmd))
+        ) from exc
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -103,11 +156,15 @@ class ChangePair:
 class GitHistorySource:
     """Abstract git history access used by the change-pair extractor."""
 
+    def __init__(self, git_timeout: Optional[int] = None) -> None:
+        #: git subprocess timeout (None = resolve env/default at call time).
+        self.git_timeout = git_timeout
+
     def clone_or_fetch(self) -> None:
         """Ensure the repository is available (clone or incremental fetch)."""
         raise NotImplementedError
 
-    def list_config_files(self, glob_pattern: Optional[str] = None) -> List[str]:
+    def list_config_files(self, glob_pattern: GlobFilter = None) -> List[str]:
         """List config-whitelisted files at HEAD, optionally filtered by glob."""
         raise NotImplementedError
 
@@ -116,7 +173,7 @@ class GitHistorySource:
         raise NotImplementedError
 
     def changed_files(self, commit: str,
-                      glob_pattern: Optional[str] = None) -> List[str]:
+                      glob_pattern: GlobFilter = None) -> List[str]:
         """Config-whitelisted files changed by ``commit`` (sorted)."""
         raise NotImplementedError
 
@@ -128,14 +185,16 @@ class GitHistorySource:
 class GitCloneSource(GitHistorySource):
     """Subprocess git source backed by a clone (partial clone, no checkout)."""
 
-    def __init__(self, owner: str, repo: str, directory: str) -> None:
+    def __init__(self, owner: str, repo: str, directory: str,
+                 git_timeout: Optional[int] = None) -> None:
+        super().__init__(git_timeout=git_timeout)
         self.owner = owner
         self.repo = repo
         self.url = "https://github.com/%s/%s.git" % (owner, repo)
         self.dir = os.path.abspath(directory)
 
     def _is_repo(self) -> bool:
-        code, _, _ = _run_git(self.dir, ["rev-parse", "--git-dir"])
+        code, _, _ = _run_git(self.dir, ["rev-parse", "--git-dir"], self.git_timeout)
         return code == 0
 
     def clone_or_fetch(self) -> None:
@@ -149,6 +208,7 @@ class GitCloneSource(GitHistorySource):
                     "clone", "--filter=blob:none", "--no-checkout",
                     self.url, self.dir,
                 ],
+                self.git_timeout,
             )
             if code != 0:
                 raise RuntimeError(
@@ -156,15 +216,17 @@ class GitCloneSource(GitHistorySource):
                 )
             return
         code, out, err = _run_git(
-            self.dir, ["fetch", "--filter=blob:none", "origin"]
+            self.dir, ["fetch", "--filter=blob:none", "origin"], self.git_timeout
         )
         if code != 0:
             raise RuntimeError(
                 "git fetch failed for %s: %s" % (self.url, (err or out).strip())
             )
 
-    def list_config_files(self, glob_pattern: Optional[str] = None) -> List[str]:
-        code, out, err = _run_git(self.dir, ["ls-tree", "-r", "--name-only", "HEAD"])
+    def list_config_files(self, glob_pattern: GlobFilter = None) -> List[str]:
+        code, out, err = _run_git(
+            self.dir, ["ls-tree", "-r", "--name-only", "HEAD"], self.git_timeout
+        )
         if code != 0:
             raise RuntimeError("git ls-tree failed: %s" % (err or out).strip())
         files = []
@@ -172,39 +234,45 @@ class GitCloneSource(GitHistorySource):
             path = line.strip()
             if not path or not is_config_path(path):
                 continue
-            if glob_pattern and not fnmatch.fnmatch(path, glob_pattern):
+            if not _matches_glob(path, glob_pattern):
                 continue
             files.append(path)
         return sorted(files)
 
     def repo_log(self, since: Optional[str] = None) -> List[Dict[str, Any]]:
-        return _repo_log(self.dir, since)
+        return _repo_log(self.dir, since, self.git_timeout)
 
     def changed_files(self, commit: str,
-                      glob_pattern: Optional[str] = None) -> List[str]:
-        return _changed_files(self.dir, commit, glob_pattern)
+                      glob_pattern: GlobFilter = None) -> List[str]:
+        return _changed_files(self.dir, commit, glob_pattern, self.git_timeout)
 
     def show(self, commit: str, relpath: str) -> Optional[str]:
-        return _show_file(self.dir, commit, relpath)
+        return _show_file(self.dir, commit, relpath, self.git_timeout)
 
 
 class LocalRepoSource(GitHistorySource):
     """A local git repository used directly (offline / CI-safe)."""
 
-    def __init__(self, directory: str) -> None:
+    def __init__(self, directory: str,
+                 git_timeout: Optional[int] = None) -> None:
+        super().__init__(git_timeout=git_timeout)
         self.dir = os.path.abspath(directory)
 
     def clone_or_fetch(self) -> None:
         if not os.path.isdir(self.dir):
             raise ValueError("local git repository not found: %s" % self.dir)
-        code, _, err = _run_git(self.dir, ["rev-parse", "--git-dir"])
+        code, _, err = _run_git(
+            self.dir, ["rev-parse", "--git-dir"], self.git_timeout
+        )
         if code != 0:
             raise ValueError(
                 "%s is not a git repository: %s" % (self.dir, (err or "").strip())
             )
 
-    def list_config_files(self, glob_pattern: Optional[str] = None) -> List[str]:
-        code, out, err = _run_git(self.dir, ["ls-tree", "-r", "--name-only", "HEAD"])
+    def list_config_files(self, glob_pattern: GlobFilter = None) -> List[str]:
+        code, out, err = _run_git(
+            self.dir, ["ls-tree", "-r", "--name-only", "HEAD"], self.git_timeout
+        )
         if code != 0:
             raise RuntimeError("git ls-tree failed: %s" % (err or out).strip())
         files = []
@@ -212,27 +280,28 @@ class LocalRepoSource(GitHistorySource):
             path = line.strip()
             if not path or not is_config_path(path):
                 continue
-            if glob_pattern and not fnmatch.fnmatch(path, glob_pattern):
+            if not _matches_glob(path, glob_pattern):
                 continue
             files.append(path)
         return sorted(files)
 
     def repo_log(self, since: Optional[str] = None) -> List[Dict[str, Any]]:
-        return _repo_log(self.dir, since)
+        return _repo_log(self.dir, since, self.git_timeout)
 
     def changed_files(self, commit: str,
-                      glob_pattern: Optional[str] = None) -> List[str]:
-        return _changed_files(self.dir, commit, glob_pattern)
+                      glob_pattern: GlobFilter = None) -> List[str]:
+        return _changed_files(self.dir, commit, glob_pattern, self.git_timeout)
 
     def show(self, commit: str, relpath: str) -> Optional[str]:
-        return _show_file(self.dir, commit, relpath)
+        return _show_file(self.dir, commit, relpath, self.git_timeout)
 
 
 # ---------------------------------------------------------------------------
 # Shared git helpers
 # ---------------------------------------------------------------------------
 
-def _repo_log(directory: str, since: Optional[str] = None) -> List[Dict[str, Any]]:
+def _repo_log(directory: str, since: Optional[str] = None,
+              timeout: Optional[int] = None) -> List[Dict[str, Any]]:
     """Repo-wide ``git log`` (no merges), newest first."""
     args = [
         "log", "--no-merges",
@@ -240,7 +309,7 @@ def _repo_log(directory: str, since: Optional[str] = None) -> List[Dict[str, Any
     ]
     if since:
         args += ["--since=%s" % since]
-    code, out, err = _run_git(directory, args)
+    code, out, err = _run_git(directory, args, timeout)
     if code != 0:
         raise RuntimeError("git log failed: %s" % (err or out).strip())
     entries: List[Dict[str, Any]] = []
@@ -269,10 +338,11 @@ def _repo_log(directory: str, since: Optional[str] = None) -> List[Dict[str, Any
 
 
 def _changed_files(directory: str, commit: str,
-                   glob_pattern: Optional[str] = None) -> List[str]:
+                   glob_pattern: GlobFilter = None,
+                   timeout: Optional[int] = None) -> List[str]:
     """Files changed by ``commit`` (config whitelist + optional glob, sorted)."""
     code, out, err = _run_git(
-        directory, ["show", "--name-only", "--format=", commit]
+        directory, ["show", "--name-only", "--format=", commit], timeout
     )
     if code != 0:
         raise RuntimeError(
@@ -283,15 +353,16 @@ def _changed_files(directory: str, commit: str,
         path = line.strip()
         if not path or not is_config_path(path):
             continue
-        if glob_pattern and not fnmatch.fnmatch(path, glob_pattern):
+        if not _matches_glob(path, glob_pattern):
             continue
         files.append(path)
     return sorted(files)
 
 
-def _show_file(directory: str, commit: str, relpath: str) -> Optional[str]:
+def _show_file(directory: str, commit: str, relpath: str,
+               timeout: Optional[int] = None) -> Optional[str]:
     """File content at ``commit:relpath``; None when unavailable."""
-    code, out, err = _run_git(directory, ["show", "%s:%s" % (commit, relpath)])
+    code, out, err = _run_git(directory, ["show", "%s:%s" % (commit, relpath)], timeout)
     if code != 0:
         return None
     return out
@@ -340,7 +411,7 @@ class ChangePairExtractor:
         since: Optional[str] = None,
         stop_at: Optional[str] = None,
         max_pairs: Optional[int] = None,
-        glob_pattern: Optional[str] = None,
+        glob_pattern: GlobFilter = None,
     ) -> Tuple[List[ChangePair], Dict[str, int], Optional[str]]:
         """Extract change pairs from a source, newest commits first.
 

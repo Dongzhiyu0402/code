@@ -10,9 +10,14 @@ Schema (version 1)::
     repositories:
       - owner: nginx
         repo: nginx
-        glob: "conf/*.conf"        # optional glob over repo-relative paths
+        glob: "conf/*.conf"        # optional glob (str) or list of globs (OR)
         since: "2022-01-01"        # optional repo-level since (overrides global)
         local_path: ""             # optional local git repo (offline; skips clone/API)
+
+``since`` accepts a quoted ISO string **or** an unquoted YAML date (parsed as
+``datetime.date`` by PyYAML) — both are normalized to ``"YYYY-MM-DD"``.
+``glob`` accepts a single pattern string or a list of patterns (multi-pattern
+OR filtering; an empty list is equivalent to unset).
 
 A corrupt file raises :class:`ValueError` (the CLI surfaces it as exit code 2,
 matching severity.yaml / constraints.yaml).
@@ -20,10 +25,11 @@ matching severity.yaml / constraints.yaml).
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
@@ -42,6 +48,51 @@ EXTENSION_FORMATS = {
     ".toml": "toml",
     ".ini": "ini",
 }
+
+#: A glob filter is either a single pattern or a list of patterns (OR).
+GlobValue = Optional[Union[str, List[str]]]
+
+
+def _normalize_since(value: Any, where: str = "since") -> Optional[str]:
+    """Normalize a ``since`` value to an ISO date string.
+
+    Accepts ``str`` (used as-is after stripping) and ``datetime.date`` /
+    ``datetime.datetime`` (formatted as ``YYYY-MM-DD``) — unquoted YAML dates
+    like ``since: 2024-01-01`` parse to a ``date`` object, which real users
+    hit constantly.  Raises :class:`ValueError` for anything else.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, datetime.datetime):
+        return str(value.date())
+    if isinstance(value, datetime.date):
+        return str(value)
+    raise ValueError("%s must be an ISO date string" % where)
+
+
+def _normalize_glob(value: Any, where: str = "glob") -> GlobValue:
+    """Normalize a ``glob`` filter to ``None`` / ``str`` / ``List[str]``.
+
+    A single string keeps its original behavior; a list means multi-pattern
+    (OR semantics in the fetcher); an empty list is equivalent to unset.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, list):
+        patterns: List[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("%s must be a string or a list of strings" % where)
+            stripped = item.strip()
+            if stripped:
+                patterns.append(stripped)
+        return patterns or None
+    raise ValueError("%s must be a string or a list of strings" % where)
 
 
 def fmt_for_path(relpath: str) -> Optional[str]:
@@ -62,7 +113,7 @@ class CorpusRepository:
 
     owner: str = ""
     repo: str = ""
-    glob: Optional[str] = None
+    glob: GlobValue = None
     since: Optional[str] = None
     local_path: Optional[str] = None
 
@@ -84,12 +135,10 @@ class CorpusRepository:
             raise ValueError(
                 "corpus repository requires 'owner' + 'repo' or 'local_path'"
             )
-        if self.glob is not None and not isinstance(self.glob, str):
-            raise ValueError("corpus repository 'glob' must be a string")
-        if self.since is not None and not isinstance(self.since, str):
-            raise ValueError(
-                "corpus repository 'since' must be an ISO date string"
-            )
+        self.glob = _normalize_glob(self.glob, "corpus repository 'glob'")
+        self.since = _normalize_since(
+            self.since, "corpus repository 'since'"
+        )
 
     def to_dict(self) -> dict:
         out: Dict[str, Any] = {}
@@ -119,17 +168,12 @@ class CorpusRepository:
                 "corpus.yaml repositories[%d] requires 'owner' + 'repo' "
                 "or 'local_path'" % index
             )
-        glob_pattern = data.get("glob")
-        if glob_pattern is not None and not isinstance(glob_pattern, str):
-            raise ValueError(
-                "corpus.yaml repositories[%d] 'glob' must be a string" % index
-            )
-        since = data.get("since")
-        if since is not None and not isinstance(since, str):
-            raise ValueError(
-                "corpus.yaml repositories[%d] 'since' must be an ISO date "
-                "string" % index
-            )
+        glob_pattern = _normalize_glob(
+            data.get("glob"), "corpus.yaml repositories[%d] 'glob'" % index
+        )
+        since = _normalize_since(
+            data.get("since"), "corpus.yaml repositories[%d] 'since'" % index
+        )
         return cls(
             owner=owner,
             repo=repo,
@@ -158,8 +202,16 @@ class CorpusConfig:
         return (self.token or "").strip()
 
     def effective_since(self, repo: CorpusRepository) -> Optional[str]:
-        """Repo-level since overrides the global one."""
-        return repo.since or self.since
+        """Repo-level since overrides the global one.
+
+        Both values are normalized to ISO strings defensively so a config
+        built programmatically (without ``validate()``) still yields strings
+        for ``git log --since=...``.
+        """
+        repo_since = _normalize_since(repo.since, "corpus repository 'since'")
+        if repo_since is not None:
+            return repo_since
+        return _normalize_since(self.since, "corpus.yaml 'since'")
 
     def validate(self) -> None:
         """Validate the configuration; raises ``ValueError`` when corrupt."""
@@ -168,8 +220,7 @@ class CorpusConfig:
                 "unsupported corpus config version %r (expected %d)"
                 % (self.version, _CORPUS_CONFIG_VERSION)
             )
-        if self.since is not None and not isinstance(self.since, str):
-            raise ValueError("corpus.yaml 'since' must be an ISO date string")
+        self.since = _normalize_since(self.since, "corpus.yaml 'since'")
         if self.min_stars is not None:
             if not isinstance(self.min_stars, (int, float)) or isinstance(
                 self.min_stars, bool
@@ -219,7 +270,7 @@ class CorpusConfig:
         ]
         cfg = CorpusConfig(
             version=version,
-            since=data.get("since"),
+            since=_normalize_since(data.get("since"), "corpus.yaml 'since'"),
             min_stars=data.get("min_stars"),
             max_instances=int(data.get("max_instances", 200)),
             token=str(data.get("token", "") or ""),

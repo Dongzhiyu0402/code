@@ -128,6 +128,23 @@ class CorpusWorkspace:
             raise ValueError("corrupt state.json: repo %r must be a mapping" % key)
         return entry
 
+    def set_repo_error(self, state: Dict[str, Any], key: str, error: str) -> None:
+        """Mark a repository as failed with ``error`` (partial-success state).
+
+        The previous progress (``last_commit`` / ``instance_count`` /
+        ``local_path``) is intentionally kept: a later transient failure must
+        never discard already-collected change pairs.  ``corpus fetch`` skips
+        error-marked repositories unless ``--retry-failed`` is given; the user
+        can also delete the ``"error"`` marker to retry.
+        """
+        entry = self.repo_state(state, key)
+        entry["error"] = str(error)
+
+    @staticmethod
+    def clear_repo_error(entry: Dict[str, Any]) -> None:
+        """Remove the error marker from a repo entry after a successful run."""
+        entry.pop("error", None)
+
     def resolve_local_path(self, entry: Dict[str, Any], fallback: str) -> str:
         """Return the git repo path for an entry: recorded local_path or clone."""
         recorded = entry.get("local_path")
