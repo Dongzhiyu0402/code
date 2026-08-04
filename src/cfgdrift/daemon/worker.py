@@ -28,6 +28,7 @@ from ..alert.config import AlertConfig
 from ..alert.dispatcher import AlertDispatcher
 from ..alert.state import AlertStateStore
 from ..core.differ import SemanticDiffer
+from ..core.constraints import violations_from_items
 from ..core.masker import SensitiveMasker, masking_config_path
 from ..core.model import Constraint, Report, ScanSummary
 from ..rules.constraints import (
@@ -244,6 +245,12 @@ class DaemonWorker:
         payload = {"code": 0, "data": report.to_dict(), "message": "ok"}
         scan_id = store.add_scan(baseline.id, "daemon", payload)
         report.scan_id = scan_id
+        # v0.7.0 (D1): the differ/engine stay pure — drift constraint
+        # violations are persisted here, in the calling layer, right after
+        # add_scan (daemon does not surface baseline violations, §6.9).
+        drift_rows = violations_from_items(items)
+        if drift_rows:
+            store.add_constraint_violations(scan_id, drift_rows)
         self.log.info(
             "scan cycle done scan_id=%d target=%s total=%d max=%s",
             scan_id,

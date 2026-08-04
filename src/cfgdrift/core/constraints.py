@@ -42,6 +42,7 @@ __all__ = [
     "BUILTIN_CONSTRAINTS",
     "apply_constraints",
     "constraint_types",
+    "violations_from_items",
 ]
 
 constraint_types = CONSTRAINT_TYPES
@@ -399,6 +400,106 @@ class ConstraintEngine:
                 )
         new_rank = min(3, max(item.severity.rank + 1, max_constraint_rank))
         item.severity = _SEV_BY_RANK[new_rank]
+
+    @staticmethod
+    def check_tree(constraints: Optional[List[Constraint]],
+                   new_snapshot: Optional[dict]) -> List[dict]:
+        """Evaluate every enabled constraint against the whole new snapshot.
+
+        Returns **ALL** violations (not only drift-associated ones), each as
+        ``{constraint_id, type, message, involved_keys, file, severity}``.
+        ``severity`` is taken directly from the constraint itself (Q6).  The
+        function is pure: it never touches the database.
+        """
+        if not constraints or not new_snapshot:
+            return []
+        enabled = [c for c in constraints if c.enabled]
+        if not enabled:
+            return []
+        out: List[dict] = []
+        for relpath in sorted(new_snapshot.keys()):
+            tree = new_snapshot[relpath]
+            if not isinstance(tree, dict):
+                continue
+            for constraint in enabled:
+                for violation in ConstraintEngine.check_one(constraint, tree):
+                    out.append(
+                        {
+                            "constraint_id": violation.constraint_id,
+                            "type": violation.type,
+                            "message": violation.message,
+                            "involved_keys": list(violation.involved_keys),
+                            "file": relpath,
+                            "severity": constraint.severity.value,
+                        }
+                    )
+        return out
+
+    @staticmethod
+    def baseline_violations(constraints: Optional[List[Constraint]],
+                            new_snapshot: Optional[dict],
+                            drift_items: Optional[List[DriftItem]]) -> List[dict]:
+        """Pre-existing violations = check_tree − drift-associated violations.
+
+        The signature used for de-duplication is
+        ``(constraint_id, file, frozenset(involved_keys))``: a violation that
+        is already attached to a drift item (i.e. its keys intersect the drift
+        keys of that file) is *not* re-reported as baseline.  Severity is the
+        constraint's own severity (Q6).  Pure function, zero DB access.
+        """
+        if not constraints or not new_snapshot:
+            return []
+        all_violations = ConstraintEngine.check_tree(constraints, new_snapshot)
+        if not all_violations:
+            return []
+        drift_signatures: set = set()
+        for item in drift_items or []:
+            file = item.file or ""
+            for violation in getattr(item, "constraint_violations", None) or []:
+                involved = frozenset(violation.get("involved_keys") or [])
+                drift_signatures.add(
+                    (violation.get("constraint_id", ""), file, involved)
+                )
+        out: List[dict] = []
+        seen: set = set()
+        for violation in all_violations:
+            involved = frozenset(violation["involved_keys"])
+            signature = (violation["constraint_id"], violation["file"], involved)
+            if signature in drift_signatures:
+                continue
+            if signature in seen:
+                continue
+            seen.add(signature)
+            out.append(violation)
+        return out
+
+
+def violations_from_items(items: Optional[List[DriftItem]]) -> List[dict]:
+    """Extract C-10 rows from drift items' attached constraint violations (D1).
+
+    Each returned row is shaped for ``Store.add_constraint_violations``:
+    ``{constraint_id, kind: 'drift', file, keys, severity, detail}``.  The
+    severity is the item's (post-upgrade) severity — the value users see in
+    the drift report.  This is the *only* place drift violations are turned
+    into rows; the differ/engine never write to the database.
+    """
+    rows: List[dict] = []
+    for item in items or []:
+        for violation in getattr(item, "constraint_violations", None) or []:
+            severity = item.severity
+            rows.append(
+                {
+                    "constraint_id": violation.get("constraint_id", ""),
+                    "kind": "drift",
+                    "file": item.file or "",
+                    "keys": list(violation.get("involved_keys") or []),
+                    "severity": severity.value
+                    if isinstance(severity, Severity)
+                    else str(severity),
+                    "detail": violation.get("message", ""),
+                }
+            )
+    return rows
 
 
 def apply_constraints(new_snapshot: Optional[dict], items: List[DriftItem],

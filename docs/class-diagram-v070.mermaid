@@ -1,0 +1,106 @@
+classDiagram
+    class CorpusConfig {
+        +int version
+        +str since
+        +int min_stars
+        +int max_instances
+        +str token
+        +List~dict~ repositories
+        +load(path) CorpusConfig
+        +save(path, cfg) None
+        +validate() None
+    }
+    class CorpusWorkspace {
+        +str root
+        +init(root) None
+        +read_state() dict
+        +write_state(state) None
+        +repo_dir(owner, repo) str
+    }
+    class GitHistorySource {
+        <<abstract>>
+        +clone_or_fetch() None
+        +list_config_files(glob) List~str~
+        +commit_log(path, since) List~dict~
+        +show(commit, path) Optional~str~
+    }
+    class GitCloneSource {
+        +str url
+        +str dir
+        +clone_or_fetch() None
+    }
+    class LocalRepoSource {
+        +str dir
+        +clone_or_fetch() None
+    }
+    class ChangePairExtractor {
+        +extract(source, relpath, since) List~ChangePair~
+    }
+    class ChangePair {
+        +str relpath
+        +str commit
+        +str commit_time
+        +str author
+        +str message
+        +Optional~str~ before_text
+        +Optional~str~ after_text
+    }
+    class GitHubApi {
+        +fetch_repo(owner, repo, token) Optional~dict~
+    }
+    class CorpusExporter {
+        +export(workspace, constraints, output) int
+        +_build_instance(pair, fmt, differ, constraints) dict
+    }
+    class CorpusValidator {
+        +validate(path) dict
+    }
+    class MinedCandidate {
+        +str id
+        +str kind
+        +dict constraint
+        +dict metrics
+        +str status
+    }
+    class ConstraintMiner {
+        +mine_scans(store, min_support) List~MinedCandidate~
+        +mine_corpus(jsonl_path, min_support) List~MinedCandidate~
+        +save_candidates(path, candidates) None
+        +load_candidates(path) List~MinedCandidate~
+    }
+    class ConstraintEngine {
+        +check_one(constraint, tree) List~ConstraintViolation~
+        +apply(new_snapshot, items, constraints) None
+        +check_tree(constraints, new_snapshot) List~dict~
+        +baseline_violations(constraints, new_snapshot, drift_items) List~dict~
+    }
+    class Store {
+        +add_scan(baseline_id, mode, report) int
+        +add_constraint_violations(scan_id, violations) int
+        +list_constraint_violations(constraint_id, kind, limit, offset) dict
+        +prune_constraint_violations(days, max_rows) int
+    }
+    class Report {
+        +List~dict~ baseline_violations
+        +to_dict() dict
+    }
+    class WebApp {
+        +GET /api/constraints
+        +PUT /api/constraints/{id}/enabled
+        +GET /api/constraint-events
+    }
+
+    GitCloneSource ..|> GitHistorySource
+    LocalRepoSource ..|> GitHistorySource
+    ChangePairExtractor ..> GitHistorySource : 读取
+    ChangePairExtractor ..> ChangePair : 生成
+    CorpusExporter ..> ChangePair : 消费
+    CorpusExporter ..> ConstraintEngine : 经 diff_snapshot 复用
+    CorpusWorkspace ..> CorpusConfig : 读写 corpus.yaml/state.json
+    ConstraintMiner ..> MinedCandidate : 生成
+    ConstraintMiner ..> Store : mine_scans(scan_items)
+    ConstraintMiner ..> CorpusExporter : mine_corpus(instances.jsonl)
+    ConstraintEngine ..> Store : violations_from_items → add_constraint_violations（调用层）
+    Store ..> Report : C-10 行（scan_id 关联）
+    WebApp ..> ConstraintEngine : resolve 生效约束（D6）
+    WebApp ..> Store : constraint-events

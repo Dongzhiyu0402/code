@@ -86,3 +86,9 @@ _qa_target/
 _qa7_fix_e2e.py
 demo_gate*/
 demo_gate2/
+dist-v060/
+
+# v0.7.0 调试/临时产物
+_qa8_*.txt
+_qa8_*/
+_qa8_*.py

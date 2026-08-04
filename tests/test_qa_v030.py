@@ -164,7 +164,7 @@ def test_e2e_daemon_foreground_webhook(cfg_home, project, webhook_server):
         payload = collector.wait_payload(timeout=15)
         assert payload is not None, "no webhook payload received"
         assert payload["event"] == "cfgdrift.drift"
-        assert payload["version"] == "0.6.0"
+        assert payload["version"] == "0.7.0"
         assert payload["baseline"] == "prod"
         assert payload["drift_count"] >= 1
         assert payload["summary"].startswith(
@@ -205,7 +205,7 @@ def test_alert_test_script_ok_and_fail(cfg_home, tmp_path):
     ok_script.write_text(
         "import os\n"
         "assert os.environ['CFGDRIFT_EVENT'] == 'cfgdrift.test', os.environ\n"
-        "assert os.environ['CFGDRIFT_VERSION'] == '0.6.0'\n",
+        "assert os.environ['CFGDRIFT_VERSION'] == '0.7.0'\n",
         encoding="utf-8",
     )
     p = run_cli(

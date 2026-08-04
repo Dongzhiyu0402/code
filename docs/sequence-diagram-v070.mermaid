@@ -1,0 +1,109 @@
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as cli corpus fetch
+    participant WS as CorpusWorkspace
+    participant SRC as GitHistorySource
+    participant XTR as ChangePairExtractor
+    participant EXP as CorpusExporter
+    participant DF as SemanticDiffer
+    participant CE as ConstraintEngine
+    participant FS as instances.jsonl
+
+    U->>CLI: corpus fetch --workspace W
+    CLI->>WS: load corpus.yaml + state.json
+    WS-->>CLI: repos / last_commit / token
+    loop 每仓库
+        CLI->>SRC: clone_or_fetch()（local_path 直用 / git clone --filter=blob:none / git fetch）
+        CLI->>SRC: list_config_files(glob) → 白名单扩展名文件
+        CLI->>XTR: extract(source, relpath, since, last_commit)
+        XTR->>SRC: git log --no-merges --format=... -- <file>
+        XTR->>SRC: git show <commit>^:<file> / <commit>:<file>
+        XTR-->>CLI: 变更对列表（before/after 文本）
+        CLI->>WS: 更新 state.json（last_commit / instance_count）
+    end
+    CLI->>EXP: export(workspace, constraints, instances.jsonl)
+    loop 每变更对
+        EXP->>EXP: parse_text(before/after, fmt) → before_tree/after_tree
+        EXP->>DF: diff_snapshot({f: before}, {f: after}, constraints=...)
+        DF->>CE: apply_constraints（v0.6.0 既有路径：挂 violation + 升级）
+        DF-->>EXP: items + summary（含 constraint_violations）
+        EXP->>EXP: 组装实例 dict（metadata + before/after + diff.feature + labels）
+    end
+    EXP->>FS: 全量重写 JSONL（每行一个实例）
+    CLI-->>U: 统计（实例数 / 仓库数 / 解析失败计数）
+
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as cli constraint mine
+    participant MIN as ConstraintMiner
+    participant ST as Store(scan_items)
+    participant COR as instances.jsonl
+    participant YAML as mined_candidates.yaml
+
+    U->>CLI: constraint mine --min-support 5 --source scans|corpus [--corpus F]
+    alt source=scans
+        CLI->>MIN: mine_scans(store, min_support)
+        MIN->>ST: 读 scan_items（按 scan_id 分组 = 同变单元）
+    else source=corpus
+        CLI->>MIN: mine_corpus(jsonl_path, min_support)
+        MIN->>COR: 读 diff.feature（changed_keys / changed_values / co_change_pairs）
+    end
+    MIN->>MIN: 值域聚合（enum/range 启发式）
+    MIN->>MIN: 共现计数（co(A,B)/cnt(A) → conditional_required 候选）
+    MIN->>MIN: 零交集检测（joint==0 → mutual_exclusion 候选，top-N）
+    MIN->>MIN: 组装 MinedCandidate（constraint.enabled=false, metrics, status=pending）
+    MIN->>YAML: save_candidates(<home>/mined_candidates.yaml)
+    CLI-->>U: terminal/--json 列表 + 转正命令（constraint add --rule '<json>'）
+    Note over U: 人工确认 → constraint add --rule → 生效（v0.6.0 既有路径，下周期/下次 scan 生效）
+
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant CLI as cli scan
+    participant SC as Scanner
+    participant DF as SemanticDiffer
+    participant CE as ConstraintEngine
+    participant ST as Store
+    participant RP as Reporter
+
+    U->>CLI: scan PATH --baseline B --report-violations
+    CLI->>SC: scan_path_with_lines(PATH, fmt)
+    SC-->>CLI: (snapshot, line_maps)
+    CLI->>DF: diff_snapshot(baseline.data, snapshot, constraints=...) → (items, summary)
+    DF->>CE: apply_constraints（漂移关联违反 + 升级）
+    alt --report-violations 开启
+        CLI->>CE: baseline_violations(constraints, snapshot, items)
+        CE->>CE: check_tree 全部违反 − 漂移关联签名差集
+        CE-->>CLI: baseline_violations（severity 直取约束）
+    end
+    CLI->>ST: add_scan(baseline_id, mode, payload) → scan_id
+    CLI->>ST: add_constraint_violations(scan_id, violations_from_items(items) + baseline_rows)
+    CLI->>RP: render_terminal / render_json
+    RP-->>U: 漂移 items + "Baseline violations:" section（terminal）/ baseline_violations 字段（json）
+
+sequenceDiagram
+    autonumber
+    participant SPA as SPA 约束视图
+    participant API as web/app.py
+    participant CFG as rules.constraints.resolve / ConstraintConfig
+    participant ST as Store
+    participant WK as cli/daemon 扫描
+    participant CE as ConstraintEngine
+
+    SPA->>API: GET /api/constraints
+    API->>CFG: resolve(home, [], builtin_enabled=True) → 生效约束
+    CFG-->>API: [{id,type,keys,severity,enabled,source,message}]
+    API-->>SPA: ok({constraints:[...]})
+    SPA->>API: PUT /api/constraints/{id}/enabled {enabled:false}
+    API->>API: 查生效约束 source（builtin → 400）
+    API->>CFG: ConstraintConfig.set_enabled(<home>/constraints.yaml, id, false)
+    API-->>SPA: ok({id, enabled:false})
+    Note over WK,CE: 每轮 diff/scan/daemon（T01 接线）
+    WK->>CE: diff_snapshot(constraints=...) → items（violations_from_items）
+    WK->>ST: add_constraint_violations(scan_id, drift 违反 [± baseline 违反])
+    SPA->>API: GET /api/constraint-events?limit=50&offset=0
+    API->>ST: list_constraint_violations(...)
+    ST-->>API: {events:[...], total:N}
+    API-->>SPA: ok({events, total}) → 最近违反表（时间/约束/severity/文件/keys/消息 + 分页）

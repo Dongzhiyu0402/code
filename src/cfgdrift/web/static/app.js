@@ -508,6 +508,88 @@ async function openSnippet(root, file, line) {
 }
 
 // ---------------------------------------------------------------------------
+// Constraints view (v0.7.0, C-09 / C-10)
+// ---------------------------------------------------------------------------
+
+let cvPage = 0;
+const CV_PAGE_SIZE = 50;
+
+async function renderConstraints() {
+  const data = await api("/api/constraints");
+  const constraints = data.constraints || [];
+
+  const table =
+    '<div class="card"><h3 style="margin-bottom:10px">一致性约束（生效视角）</h3>' +
+    '<table><thead><tr><th>ID</th><th>类型</th><th>键</th><th>严重度</th><th>来源</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+    (constraints.length ? constraints.map((c) => {
+      const isUser = c.source === "user";
+      const toggleBtn = isUser
+        ? '<button class="action" data-cid="' + esc(c.id) + '" data-enabled="' + (c.enabled ? "false" : "true") + '">' +
+          (c.enabled ? "禁用" : "启用") + "</button>"
+        : '<span class="muted">内置</span>';
+      return (
+        "<tr><td><strong>" + esc(c.id) + "</strong></td><td>" + esc(c.type) + "</td><td>" +
+        esc((c.keys || []).join(", ") || "-") + "</td><td>" +
+        '<span class="badge ' + sevClass(c.severity) + '">' + esc(c.severity) + "</span></td><td>" +
+        esc(c.source) + "</td><td>" + (c.enabled ? "启用" : "停用") +
+        "</td><td>" + toggleBtn + "</td></tr>"
+      );
+    }).join("") : '<tr><td colspan="7" class="muted">暂无约束</td></tr>') +
+    "</tbody></table></div>";
+
+  $("#view-constraints").innerHTML =
+    "<h2>约束</h2>" + table + '<div id="cvEvents"></div>';
+
+  document.querySelectorAll("#view-constraints [data-cid]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await api("/api/constraints/" + encodeURIComponent(btn.dataset.cid) + "/enabled", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: btn.dataset.enabled === "true" }),
+        });
+        renderConstraints();
+      } catch (e) {
+        alert("切换失败：" + e.message);
+      }
+    });
+  });
+
+  await renderConstraintEvents();
+}
+
+async function renderConstraintEvents() {
+  const data = await api(
+    "/api/constraint-events?limit=" + CV_PAGE_SIZE + "&offset=" + cvPage * CV_PAGE_SIZE
+  );
+  const events = data.events || [];
+  const total = data.total || 0;
+
+  $("#cvEvents").innerHTML =
+    '<div class="card"><h3 style="margin-bottom:10px">约束违反（最近 ' + CV_PAGE_SIZE + " 条 / 共 " + total + " 条）</h3>" +
+    '<table><thead><tr><th>ID</th><th>约束</th><th>类型</th><th>严重度</th><th>文件</th><th>键</th><th>消息</th><th>时间</th></tr></thead><tbody>' +
+    (events.length ? events.map((ev) =>
+      "<tr><td>#" + ev.id + "</td><td>" + esc(ev.constraint_id) + "</td><td>" + esc(ev.kind) + "</td><td>" +
+      '<span class="badge ' + sevClass(ev.severity) + '">' + esc(ev.severity) + "</span></td><td>" +
+      esc(ev.file || "-") + "</td><td>" + esc((ev.keys || []).join(", ") || "-") + "</td><td>" +
+      esc(ev.detail || "-") + "</td><td>" + fmtTime(ev.created_at) + "</td></tr>"
+    ).join("") : '<tr><td colspan="8" class="muted">暂无约束违反</td></tr>') +
+    "</tbody></table>" +
+    '<div class="pager">' +
+    '<button id="cvPrev" ' + (cvPage === 0 ? "disabled" : "") + ">上一页</button>" +
+    "<span>第 " + (cvPage + 1) + " 页</span>" +
+    '<button id="cvNext" ' + ((cvPage + 1) * CV_PAGE_SIZE >= total ? "disabled" : "") + ">下一页</button>" +
+    "</div></div>";
+
+  $("#cvPrev").addEventListener("click", () => {
+    if (cvPage > 0) { cvPage -= 1; renderConstraintEvents(); }
+  });
+  $("#cvNext").addEventListener("click", () => {
+    if ((cvPage + 1) * CV_PAGE_SIZE < total) { cvPage += 1; renderConstraintEvents(); }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Navigation
 // ---------------------------------------------------------------------------
 
@@ -520,6 +602,7 @@ const VIEWS = {
   baselines: renderBaselines,
   rules: renderRules,
   alerts: renderAlerts,
+  constraints: renderConstraints,
 };
 
 let currentView = "overview";

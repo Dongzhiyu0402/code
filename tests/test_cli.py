@@ -65,7 +65,7 @@ def test_init(cfg_home):
 def test_version_and_help():
     proc = run_cli(["--version"])
     assert proc.returncode == 0
-    assert "0.6.0" in proc.stdout
+    assert "0.7.0" in proc.stdout
     proc = run_cli(["--help"])
     assert proc.returncode == 0
     for cmd in ("init", "scan", "baseline", "diff", "report", "ignore", "serve"):

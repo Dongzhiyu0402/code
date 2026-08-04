@@ -29,13 +29,17 @@
 - **敏感值脱敏**：终端 / JSON 报告 / HTML 报告 / Web API / 告警 payload 五个显示出口对 `password` / `token` / `secret` 等 13 类敏感键自动打码（`masking.yaml` 可定制，数据库始终保存原始值）
 - **行号定位**：diff / compare 输出标明 `file:line`，便于快速定位漂移源
 - **一致性约束（v0.6.0）**：在语义 diff 之上叠加约束检查层，对「变更后配置树」跑 range / enum / conditional_required / correlation / mutual_exclusion 五类约束，仅报告**与本次漂移关联**的约束破坏，输出确定性可解释的复合告警（severity 升级 + `constraint_violations`）
+- **存量违反报告（v0.7.0）**：`cfgdrift scan --report-violations` 输出独立的「Baseline violations」section（terminal/json 均支持，**默认关闭**零噪音），严重度直接取约束自身 severity，与漂移关联的违反不重复报
+- **corpus 基准语料（v0.7.0）**：`cfgdrift corpus init|fetch|export|validate` 从真实项目 git 历史挖掘配置变更对，标准化为 `instances.jsonl` 语料（metadata + before/after 语义树 + diff + feature + labels 预留），与 diff / 约束引擎打通；支持 `local_path` 本地 git 仓库离线采集与增量拉取
+- **约束自动挖掘（v0.7.0）**：`cfgdrift constraint mine` 从历史扫描 / 语料挖掘候选（值域 enum/range、共现 conditional_required、互斥 mutual_exclusion），输出 `<home>/mined_candidates.yaml`（`enabled: false`、`status: pending`，**不自动生效**），人工确认后 `constraint add --rule` 转正
+- **Web 约束视图（v0.7.0）**：Web 仪表盘新增「约束」视图（生效约束列表 + 用户规则启用/禁用切换 + 最近约束违反分页），违反事件持久化到 C-10 `constraint_violations` 表（默认保留 90 天，`CFGDRIFT_CV_RETENTION_DAYS` 可配）
 - **自定义解析器插件**：`--format <plugin>` 支持第三方解析格式（见下文「自定义解析器插件」）
 
 退出码：`0`=无漂移，`1`=检出漂移，`2`=错误。
 
 ## 安装
 
-自 v0.2.0 起（当前版本 v0.6.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
+自 v0.2.0 起（当前版本 v0.7.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
 的通用包：C 扩展是可选加速器，未编译或安装失败时自动降级到纯 Python 解析器。
 
 ```bash
@@ -75,6 +79,8 @@ python -m build --sdist
 | `CFGDRIFT_DEBUG` | `1` | 开启 `logging.DEBUG`，日志输出当前解析后端（`parser backend: c/pure`） |
 | `CFGDRIFT_NO_C` | `1` / `true` / `yes` | 构建时跳过 C 扩展编译（产出纯 wheel） |
 | `CFGDRIFT_HOME` | 路径 | 覆盖数据目录（默认 `~/.cfgdrift/`） |
+| `GITHUB_TOKEN` | token | corpus star 检查的 GitHub token（优先级高于 corpus.yaml `token` 字段） |
+| `CFGDRIFT_CV_RETENTION_DAYS` | 整数 | C-10 `constraint_violations` 表保留天数（默认 90；每 200 次插入惰性清理，行数上限 20000） |
 
 ### 双模式一致性
 
@@ -360,3 +366,99 @@ entry point 两种注册形态）。
 - 未注册的 `--format` 报错包含注册指引（`cfgdrift.parsers` entry point 组 / `register_plugin`）
 - 同名冲突 entry point 覆盖装饰器；单个插件加载失败仅 warning，不影响内置解析器
 - 插件发现使用 Python 3.8+ 标准库 `importlib.metadata`，零新增依赖
+
+
+## v0.7.0 增量：corpus 语料 / 约束挖掘 / Web 约束视图 / 存量违反报告
+
+v0.7.0 在 v0.6.0 一致性约束之上新增四项能力，全部以**新模块承载 + 既有接口可选参数/条件输出**接入；`core/differ.py` 与约束引擎保持**纯函数零 DB 依赖**（违反持久化由调用层完成）。
+
+### 1. corpus 基准语料工具链（方向 E）
+
+```bash
+cfgdrift corpus init --workspace <dir>          # 生成 corpus.yaml + state.json + repos/
+cfgdrift corpus fetch --workspace <dir>          # 拉取 git 历史 -> 变更对 -> 全量重写 instances.jsonl
+cfgdrift corpus export --workspace <dir>         # 幂等全量重写（确定性）
+cfgdrift corpus validate --workspace <dir>       # JSONL schema 校验 + 统计（损坏 exit 2）
+```
+
+- 配置 `corpus.yaml`（version:1）：`since` / `min_stars` / `max_instances`(默认 200) / `token` / `repositories[]`（`owner`+`repo` 或 `local_path` 二选一；`glob` / 仓库级 `since` 可选）。模板见 `examples/corpus.yaml.example`
+- 采集：非 local 仓库 `git clone --filter=blob:none --no-checkout` + 增量 `git fetch`；`local_path` 直用本地 git 仓库（**离线 / CI 安全**）；star 检查走 GitHub API（best-effort，失败 warning 不阻塞）
+- 增量：`state.json` 记录每仓库 `last_commit` / `stars` / `instance_count`，fetch 只处理上次之后的新提交
+- 实例 schema（`instances.jsonl` 每行一个变更实例）：`schema_version` / `instance_id` / `metadata` / `file` / `before` / `after`（语义树 + parse_ok + present）/ `diff`（items + summary + constraint_violations + feature{changed_keys, changed_values, co_change_pairs, co_change_capped}）/ `labels`（severity + annotation/annotator 预留）；**text 原文不落盘**（防膨胀）
+
+### 2. 约束自动挖掘（C-08）
+
+```bash
+cfgdrift constraint mine --min-support 5 --source scans        # 默认：当前 store 的 scan_items
+cfgdrift constraint mine --source corpus --corpus instances.jsonl
+cfgdrift constraint mine --json                                # 输出完整 JSON（含 metrics）
+```
+
+- 三类候选：**值域**（enum：distinct 属于 [2,8]；range：全数值，port 键建议 [1,65535]，其余标 `observed:true`）、**共现**（conditional_required：co/cnt >= 0.8）、**互斥**（mutual_exclusion：零交集且每侧样本 >= min_support，每键对 top-5）
+- 输出 `<home>/mined_candidates.yaml`（version:1，候选 `enabled: false`、`status: pending`），**候选区永不自动生效**；转正 = `cfgdrift constraint add --rule '<constraint JSON>'`（+ `constraint enable`）。模板见 `examples/mined_candidates.yaml.example`
+
+### 3. Web 约束视图（C-09）+ C-10 违反持久化
+
+- 新表 `constraint_violations`（drift / baseline 两 kind），默认保留 90 天（`CFGDRIFT_CV_RETENTION_DAYS` 可配），每 200 次插入惰性清理 + 行数上限 20000
+- Web 新端点：`GET /api/constraints`（生效视角，与 `constraint list --source all` 一致）、`PUT /api/constraints/{id}/enabled`（用户规则切换；内置约束 400）、`GET /api/constraint-events`（分页）
+- SPA 新增「约束」视图（生效约束表格 + 用户规则启用/禁用 + 最近违反分页）
+
+### 4. 存量违反报告（C-07）
+
+```bash
+cfgdrift scan PATH --baseline B --report-violations    # 默认关闭
+```
+
+- `ConstraintEngine.check_tree` 对 new_snapshot 逐文件跑全部启用约束；`baseline_violations` 与漂移关联违反按签名 `(constraint_id, file, frozenset(involved_keys))` 差集去重，severity 直取约束自身
+- terminal 输出「Baseline violations:」section（items 后、Summary 前）；json 输出 `baseline_violations` 字段；**默认关闭时与 v0.6.0 逐字节一致**；HTML 报告不渲染该 section（`htmlreport.py` 零改动）
+- C-10 写入：`scan --report-violations` 写 drift + baseline 两类；daemon 只写 drift 违反
+
+> 注意：`instances.jsonl` 由 `corpus fetch/export` 生成并**全量重写**（幂等）；`corpus fetch` 的 git 操作依赖 PATH 中的 `git` 可执行文件；离线/CI 请使用 `local_path` 本地 git 仓库。
+
+
+## v0.7.0 增量：corpus 语料 / 约束挖掘 / Web 约束视图 / 存量违反报告
+
+v0.7.0 在 v0.6.0 一致性约束之上新增四项能力，全部以**新模块承载 + 既有接口可选参数/条件输出**接入；`core/differ.py` 与约束引擎保持**纯函数零 DB 依赖**（违反持久化由调用层完成）。
+
+### 1. corpus 基准语料工具链（方向 E）
+
+```bash
+cfgdrift corpus init --workspace <dir>          # 生成 corpus.yaml + state.json + repos/
+cfgdrift corpus fetch --workspace <dir>          # 拉取 git 历史 -> 变更对 -> 全量重写 instances.jsonl
+cfgdrift corpus export --workspace <dir>         # 幂等全量重写（确定性）
+cfgdrift corpus validate --workspace <dir>       # JSONL schema 校验 + 统计（损坏 exit 2）
+```
+
+- 配置 `corpus.yaml`（version:1）：`since` / `min_stars` / `max_instances`(默认 200) / `token` / `repositories[]`（`owner`+`repo` 或 `local_path` 二选一；`glob` / 仓库级 `since` 可选）。模板见 `examples/corpus.yaml.example`
+- 采集：非 local 仓库 `git clone --filter=blob:none --no-checkout` + 增量 `git fetch`；`local_path` 直用本地 git 仓库（**离线 / CI 安全**）；star 检查走 GitHub API（best-effort，失败 warning 不阻塞）
+- 增量：`state.json` 记录每仓库 `last_commit` / `stars` / `instance_count`，fetch 只处理上次之后的新提交
+- 实例 schema（`instances.jsonl` 每行一个变更实例）：`schema_version` / `instance_id` / `metadata` / `file` / `before` / `after`（语义树 + parse_ok + present）/ `diff`（items + summary + constraint_violations + feature{changed_keys, changed_values, co_change_pairs, co_change_capped}）/ `labels`（severity + annotation/annotator 预留）；**text 原文不落盘**（防膨胀）
+
+### 2. 约束自动挖掘（C-08）
+
+```bash
+cfgdrift constraint mine --min-support 5 --source scans        # 默认：当前 store 的 scan_items
+cfgdrift constraint mine --source corpus --corpus instances.jsonl
+cfgdrift constraint mine --json                                # 输出完整 JSON（含 metrics）
+```
+
+- 三类候选：**值域**（enum：distinct 属于 [2,8]；range：全数值，port 键建议 [1,65535]，其余标 `observed:true`）、**共现**（conditional_required：co/cnt >= 0.8）、**互斥**（mutual_exclusion：零交集且每侧样本 >= min_support，每键对 top-5）
+- 输出 `<home>/mined_candidates.yaml`（version:1，候选 `enabled: false`、`status: pending`），**候选区永不自动生效**；转正 = `cfgdrift constraint add --rule '<constraint JSON>'`（+ `constraint enable`）。模板见 `examples/mined_candidates.yaml.example`
+
+### 3. Web 约束视图（C-09）+ C-10 违反持久化
+
+- 新表 `constraint_violations`（drift / baseline 两 kind），默认保留 90 天（`CFGDRIFT_CV_RETENTION_DAYS` 可配），每 200 次插入惰性清理 + 行数上限 20000
+- Web 新端点：`GET /api/constraints`（生效视角，与 `constraint list --source all` 一致）、`PUT /api/constraints/{id}/enabled`（用户规则切换；内置约束 400）、`GET /api/constraint-events`（分页）
+- SPA 新增「约束」视图（生效约束表格 + 用户规则启用/禁用 + 最近违反分页）
+
+### 4. 存量违反报告（C-07）
+
+```bash
+cfgdrift scan PATH --baseline B --report-violations    # 默认关闭
+```
+
+- `ConstraintEngine.check_tree` 对 new_snapshot 逐文件跑全部启用约束；`baseline_violations` 与漂移关联违反按签名 `(constraint_id, file, frozenset(involved_keys))` 差集去重，severity 直取约束自身
+- terminal 输出「Baseline violations:」section（items 后、Summary 前）；json 输出 `baseline_violations` 字段；**默认关闭时与 v0.6.0 逐字节一致**；HTML 报告不渲染该 section（`htmlreport.py` 零改动）
+- C-10 写入：`scan --report-violations` 写 drift + baseline 两类；daemon 只写 drift 违反
+
+> 注意：`instances.jsonl` 由 `corpus fetch/export` 生成并**全量重写**（幂等）；`corpus fetch` 的 git 操作依赖 PATH 中的 `git` 可执行文件；离线/CI 请使用 `local_path` 本地 git 仓库。

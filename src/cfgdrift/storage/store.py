@@ -95,12 +95,35 @@ CREATE INDEX IF NOT EXISTS idx_scan_items_scan ON scan_items(scan_id);
 CREATE INDEX IF NOT EXISTS idx_alert_events_created ON alert_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events(rule);
 CREATE INDEX IF NOT EXISTS idx_alert_events_status ON alert_events(status);
+
+-- v0.7.0: consistency-constraint violations (drift + baseline kinds).
+CREATE TABLE IF NOT EXISTS constraint_violations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    constraint_id TEXT NOT NULL,
+    scan_id       INTEGER,
+    kind          TEXT NOT NULL DEFAULT 'drift',   -- drift | baseline
+    file          TEXT NOT NULL DEFAULT '',
+    keys          TEXT NOT NULL DEFAULT '[]',      -- JSON array (involved_keys)
+    severity      TEXT NOT NULL DEFAULT 'WARN',
+    detail        TEXT NOT NULL DEFAULT '',        -- violation message
+    created_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cv_created ON constraint_violations(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cv_constraint ON constraint_violations(constraint_id);
+CREATE INDEX IF NOT EXISTS idx_cv_scan ON constraint_violations(scan_id);
 """
 
 # Lazy pruning is triggered every N alert-event inserts (v0.4.0).
 _ALERT_EVENT_PRUNE_EVERY = 100
 _ALERT_EVENT_RETENTION_DAYS = 30
 _ALERT_EVENT_MAX_ROWS = 5000
+
+# v0.7.0: constraint-violation retention (Q4) — 90 days by default, configurable
+# through CFGDRIFT_CV_RETENTION_DAYS, lazy prune every N inserts, hard row cap.
+_CV_PRUNE_EVERY = 200
+_CV_RETENTION_DAYS = 90
+_CV_MAX_ROWS = 20000
 
 
 class Store:
@@ -120,6 +143,8 @@ class Store:
         self._conn.execute("PRAGMA foreign_keys = ON")
         # v0.4.0: lazy alert-event pruning counter (prune every N inserts).
         self._alert_insert_count = 0
+        # v0.7.0: lazy constraint-violation pruning counter (prune every N inserts).
+        self._cv_insert_count = 0
         self.init_schema()
 
     # -- schema -----------------------------------------------------------
@@ -393,6 +418,50 @@ class Store:
             raise ValueError("scan %d not found" % scan_id)
         return row["created_at"]
 
+    def list_scan_items(
+        self, scan_id: Optional[int] = None, limit: int = 100000
+    ) -> List[Dict[str, Any]]:
+        """Return scan items for mining (v0.7.0, C-08).
+
+        Values are decoded back from their JSON TEXT representation.  With
+        ``scan_id=None`` all items are returned (grouping by ``scan_id`` is
+        the caller's job — each scan is one "same-change unit").
+        """
+        if scan_id is None:
+            rows = self._conn.execute(
+                "SELECT scan_id, key_path, change_type, old_value, new_value, "
+                "file FROM scan_items ORDER BY id LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT scan_id, key_path, change_type, old_value, new_value, "
+                "file FROM scan_items WHERE scan_id = ? ORDER BY id LIMIT ?",
+                (int(scan_id), int(limit)),
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "scan_id": int(r["scan_id"]),
+                    "key_path": r["key_path"],
+                    "change_type": r["change_type"],
+                    "old_value": self._json_load(r["old_value"]),
+                    "new_value": self._json_load(r["new_value"]),
+                    "file": r["file"],
+                }
+            )
+        return out
+
+    @staticmethod
+    def _json_load(value: Optional[str]) -> Any:
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+
     # -- ignore rules -----------------------------------------------------
 
     def add_rule(self, rule: IgnoreRule) -> int:
@@ -542,6 +611,162 @@ class Store:
             cur2 = self._conn.execute(
                 "DELETE FROM alert_events WHERE id IN ("
                 "SELECT id FROM alert_events ORDER BY id ASC LIMIT ?)",
+                (excess,),
+            )
+            removed += int(cur2.rowcount)
+        if removed:
+            self._conn.commit()
+        return removed
+
+    # -- constraint violations (v0.7.0, C-10) ---------------------------
+
+    @staticmethod
+    def _cv_retention_days() -> int:
+        """Retention days for constraint violations (CFGDRIFT_CV_RETENTION_DAYS)."""
+        raw = os.environ.get("CFGDRIFT_CV_RETENTION_DAYS", "")
+        if raw.strip():
+            try:
+                return max(1, int(raw.strip()))
+            except (TypeError, ValueError):
+                return _CV_RETENTION_DAYS
+        return _CV_RETENTION_DAYS
+
+    def add_constraint_violations(
+        self, scan_id: Optional[int], violations: List[dict]
+    ) -> int:
+        """Batch-insert constraint violations (C-10); returns the row count.
+
+        ``scan_id`` may be ``None`` (violations recorded outside a scan); each
+        element of ``violations`` carries ``constraint_id`` / ``kind`` /
+        ``file`` / ``keys`` (list) / ``severity`` / ``detail`` and optionally
+        ``created_at``.  Lazy pruning runs every ``_CV_PRUNE_EVERY`` inserts
+        (retention + row cap, mirroring alert events).
+        """
+        if not violations:
+            return 0
+        now = utcnow_iso()
+        rows = []
+        for v in violations:
+            keys = v.get("keys") or []
+            if not isinstance(keys, list):
+                keys = [keys]
+            rows.append(
+                (
+                    str(v.get("constraint_id", "")),
+                    v.get("scan_id", scan_id),
+                    str(v.get("kind", "drift")),
+                    str(v.get("file", "")),
+                    json.dumps(keys, ensure_ascii=False),
+                    str(v.get("severity", "WARN")),
+                    str(v.get("detail", "")),
+                    v.get("created_at") or now,
+                )
+            )
+        self._conn.executemany(
+            "INSERT INTO constraint_violations (constraint_id, scan_id, kind, "
+            "file, keys, severity, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        self._conn.commit()
+        count = len(rows)
+        self._cv_insert_count += count
+        if self._cv_insert_count >= _CV_PRUNE_EVERY:
+            self._cv_insert_count = 0
+            self.prune_constraint_violations()
+        return count
+
+    def list_constraint_violations(
+        self,
+        constraint_id: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Return ``{"events": [...], "total": N}`` with filters + pagination.
+
+        Event dicts mirror ``list_alert_events``: ``id`` / ``constraint_id`` /
+        ``scan_id`` / ``kind`` / ``file`` / ``keys`` (parsed list) /
+        ``severity`` / ``detail`` / ``created_at``.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        if constraint_id:
+            clauses.append("constraint_id = ?")
+            params.append(constraint_id)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        total_row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM constraint_violations %s" % where, params
+        ).fetchone()
+        total = int(total_row["c"])
+
+        rows = self._conn.execute(
+            "SELECT id, constraint_id, scan_id, kind, file, keys, severity, "
+            "detail, created_at FROM constraint_violations %s "
+            "ORDER BY id DESC LIMIT ? OFFSET ?" % where,
+            params + [int(limit), int(offset)],
+        ).fetchall()
+        events = []
+        for r in rows:
+            raw_keys = r["keys"] or "[]"
+            try:
+                keys = json.loads(raw_keys)
+                if not isinstance(keys, list):
+                    keys = []
+            except (ValueError, TypeError):
+                keys = []
+            events.append(
+                {
+                    "id": int(r["id"]),
+                    "constraint_id": r["constraint_id"],
+                    "scan_id": r["scan_id"],
+                    "kind": r["kind"],
+                    "file": r["file"],
+                    "keys": keys,
+                    "severity": r["severity"],
+                    "detail": r["detail"],
+                    "created_at": r["created_at"],
+                }
+            )
+        return {"events": events, "total": total}
+
+    def count_constraint_violations(self) -> int:
+        """Total number of recorded constraint violations."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM constraint_violations"
+        ).fetchone()
+        return int(row["c"])
+
+    def prune_constraint_violations(
+        self, days: Optional[int] = None, max_rows: int = _CV_MAX_ROWS
+    ) -> int:
+        """Delete violations older than ``days`` and cap the table at rows.
+
+        ``days`` defaults to ``CFGDRIFT_CV_RETENTION_DAYS`` (or 90); the table
+        is additionally capped at ``max_rows`` (default 20000).  Returns the
+        number of deleted rows.
+        """
+        if days is None:
+            days = self._cv_retention_days()
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+        ).isoformat()
+        cur = self._conn.execute(
+            "DELETE FROM constraint_violations WHERE created_at < ?", (cutoff,)
+        )
+        removed = int(cur.rowcount)
+        count_row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM constraint_violations"
+        ).fetchone()
+        excess = int(count_row["c"]) - max(0, int(max_rows))
+        if excess > 0:
+            cur2 = self._conn.execute(
+                "DELETE FROM constraint_violations WHERE id IN ("
+                "SELECT id FROM constraint_violations ORDER BY id ASC LIMIT ?)",
                 (excess,),
             )
             removed += int(cur2.rowcount)

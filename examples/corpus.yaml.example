@@ -1,0 +1,31 @@
+# cfgdrift corpus.yaml template (v0.7.0)
+# Reference: docs/system_design_v070.md §1.2.2
+#
+#   version: 1
+#   since:            optional global ISO-date filter (only commits after this date)
+#   min_stars:        optional GitHub star floor (best-effort API check; failure warns)
+#   max_instances:    global instance cap for this fetch (default 200; per-repo share)
+#   token:            optional GitHub token (GITHUB_TOKEN env wins over this field)
+#   repositories:
+#     - owner + repo          -> cloned via `git clone --filter=blob:none --no-checkout`
+#       glob (optional)       -> only files matching this glob (repo-relative)
+#       since (optional)      -> repo-level since, overrides the global one
+#       local_path (optional) -> use a local git repository directly (offline/CI);
+#                                skips clone and star check
+
+version: 1
+since: "2023-01-01"
+min_stars: 1000
+max_instances: 200
+token: ""
+repositories:
+  - owner: nginx
+    repo: nginx
+    glob: "conf/*.conf"
+  - owner: prometheus
+    repo: prometheus
+    since: "2022-01-01"
+  # Offline / CI-safe example: point local_path at a local git repository.
+  # - owner: example
+  #   repo: local-fixture
+  #   local_path: "/absolute/path/to/git/repo"

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -20,11 +21,22 @@ from .alert.dispatcher import AlertDispatcher
 from .alert.models import AlertRule
 from .alert.state import AlertStateStore
 from .core.compare import CompareEngine
+from .core.constraints import ConstraintEngine, violations_from_items
 from .core.differ import SemanticDiffer
 from .core.masker import SensitiveMasker, masking_config_path
 from .core.model import Constraint, IgnoreRule, Report, ScanSummary, Severity
 from .core.parser import parse_file, validate_format
 from .core.reporter import Reporter
+from .corpus.config import CorpusConfig
+from .corpus.exporter import CorpusExporter
+from .corpus.fetcher import (
+    ChangePairExtractor,
+    GitCloneSource,
+    GitHubApi,
+    LocalRepoSource,
+)
+from .corpus.validator import CorpusValidator
+from .corpus.workspace import CorpusWorkspace
 from .daemon.autostart import AutostartManager
 from .daemon.daemon import DaemonManager
 from .daemon.worker import main as worker_main
@@ -34,6 +46,7 @@ from .rules.constraints import (
     resolve as resolve_constraints,
 )
 from .rules.ignore import make_rule
+from .rules.mining import ConstraintMiner
 from .rules.severity import SeverityConfig, default_path as severity_config_path
 from .rules.severity import make_rule as make_severity_rule
 from .scanner.scanner import Scanner
@@ -156,6 +169,7 @@ def _perform_scan(
     no_line: bool = False,
     masker: Optional[SensitiveMasker] = None,
     constraints: Optional[List[Constraint]] = None,
+    report_violations: bool = False,
 ) -> int:
     store = _open_store(ctx)
     snapshot, line_maps = _SCANNER.scan_path_with_lines(path, fmt)
@@ -192,6 +206,15 @@ def _perform_scan(
             constraints=constraints,
         )
 
+    # v0.7.0 (C-07): pre-existing violations are only computed when explicitly
+    # requested (default off — zero-noise contract).  severity comes straight
+    # from the constraint (Q6); drift-associated violations are excluded.
+    baseline_violations: List[dict] = []
+    if report_violations and constraints and baseline is not None:
+        baseline_violations = ConstraintEngine.baseline_violations(
+            constraints, snapshot, items
+        )
+
     report = Report(
         scan_id=None,
         baseline=baseline,
@@ -199,10 +222,34 @@ def _perform_scan(
         mode=mode,
         summary=summary,
         items=items,
+        baseline_violations=baseline_violations,
     )
     payload = _report_payload(report)
     scan_id = store.add_scan(baseline_id, mode, payload)
     report.scan_id = scan_id
+
+    # D1: differ/engine are pure — every C-10 write happens here, in the
+    # calling layer, right after add_scan (drift rows always; baseline rows
+    # only when --report-violations is on and violations exist).
+    drift_rows = violations_from_items(items)
+    if drift_rows:
+        store.add_constraint_violations(scan_id, drift_rows)
+    if baseline_violations:
+        # Baseline rows need the same involved_keys->keys / message->detail
+        # mapping as violations_from_items (store reads keys/detail).
+        baseline_rows = [
+            {
+                "constraint_id": v.get("constraint_id", ""),
+                "kind": "baseline",
+                "file": v.get("file", ""),
+                "keys": list(v.get("involved_keys") or []),
+                "severity": v.get("severity", "WARN"),
+                "detail": v.get("message", ""),
+            }
+            for v in baseline_violations
+        ]
+        store.add_constraint_violations(scan_id, baseline_rows)
+
     store.close()
 
     if baseline is None:
@@ -256,6 +303,10 @@ def _use_color(ctx: click.Context) -> bool:
 @click.option("--constraints", "constraint_files", multiple=True,
               type=click.Path(exists=True, dir_okay=False),
               help="Extra constraints.yaml file (repeatable; v0.6.0).")
+@click.option("--report-violations/--no-report-violations",
+              "report_violations", default=False,
+              help="Report pre-existing (baseline) constraint violations "
+                   "(v0.7.0; default: off).")
 @click.pass_context
 def scan(
     ctx: click.Context,
@@ -270,6 +321,7 @@ def scan(
     no_line: bool,
     builtin: bool,
     constraint_files: tuple,
+    report_violations: bool,
 ) -> int:
     """Scan a file or directory and (optionally) compare against a baseline."""
     if interval <= 0:
@@ -289,6 +341,7 @@ def scan(
             no_line=no_line,
             masker=masker,
             constraints=constraints,
+            report_violations=report_violations,
         )
 
     if watch:
@@ -300,7 +353,7 @@ def scan(
     return _perform_scan(
         ctx, path, fmt, baseline_name, save_as_baseline, mode="manual",
         description=description, no_line=no_line, masker=masker,
-        constraints=constraints,
+        constraints=constraints, report_violations=report_violations,
     )
 
 
@@ -970,6 +1023,289 @@ def constraint_disable(ctx: click.Context, constraint_id: str) -> int:
     path = constraints_config_path(_daemon_home())
     ConstraintConfig.set_enabled(path, constraint_id, False)
     click.echo("constraint %r disabled" % constraint_id)
+    return 0
+
+
+@constraint.command("mine")
+@click.option("--min-support", "min_support", default=5, type=int,
+              help="Minimum support threshold (default: 5).")
+@click.option("--source", "source", default="scans",
+              type=click.Choice(["scans", "corpus"]),
+              help="Mine from the scan history (default) or a corpus JSONL.")
+@click.option("--corpus", "corpus_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="instances.jsonl path (required with --source corpus).")
+@click.option("--output", "output_path", default=None, type=click.Path(),
+              help="Output mined_candidates.yaml (default: <home>/mined_candidates.yaml).")
+@click.option("--json", "json_output", is_flag=True,
+              help="Emit the full candidate list as JSON (with metrics).")
+@click.pass_context
+def constraint_mine(ctx: click.Context, min_support: int, source: str,
+                    corpus_path: Optional[str], output_path: Optional[str],
+                    json_output: bool) -> int:
+    """Mine constraint candidates from history (v0.7.0, C-08).
+
+    Candidates are written with ``enabled: false`` and ``status: pending``
+    and are **never auto-activated**; promote one by copying its constraint
+    JSON into ``cfgdrift constraint add --rule '<json>'``.
+    """
+    if min_support < 1:
+        raise ValueError("--min-support must be >= 1")
+    if source == "corpus" and not corpus_path:
+        raise ValueError("--source corpus requires --corpus PATH")
+    miner = ConstraintMiner()
+    if source == "scans":
+        store = _open_store(ctx)
+        try:
+            candidates = miner.mine_scans(store, min_support)
+        finally:
+            store.close()
+    else:
+        candidates = miner.mine_corpus(str(corpus_path), min_support)
+
+    out = output_path or os.path.join(_daemon_home(), "mined_candidates.yaml")
+    miner.save_candidates(out, candidates, source=source, min_support=min_support)
+
+    if json_output:
+        payload = {
+            "code": 0,
+            "data": {
+                "source": source,
+                "min_support": min_support,
+                "output": out,
+                "candidates": [c.to_dict() for c in candidates],
+            },
+            "message": "ok",
+        }
+        _echo_json(payload)
+        return 0
+
+    if not candidates:
+        click.echo("no candidates mined (min_support=%d)" % min_support)
+        return 0
+    for c in candidates:
+        keys = _candidate_keys_display(c.constraint)
+        click.echo(
+            "# %s kind=%s keys=%s support=%s conf=%.2f status=%s"
+            % (
+                c.id,
+                c.kind,
+                keys,
+                c.metrics.get("support", 0),
+                float(c.metrics.get("confidence", 0.0)),
+                c.status,
+            )
+        )
+    click.echo("candidates written to %s" % out)
+    click.echo(
+        "promote a candidate: cfgdrift constraint add --rule '<constraint JSON>'"
+    )
+    return 0
+
+
+def _candidate_keys_display(constraint: dict) -> str:
+    """Best-effort key display for a mined candidate (keys / when.key)."""
+    keys = constraint.get("keys") or []
+    if keys:
+        return ",".join(str(k) for k in keys)
+    when = constraint.get("when") or {}
+    if when.get("key"):
+        return str(when["key"])
+    return "-"
+
+
+# ---------------------------------------------------------------------------
+# corpus group (v0.7.0)
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def corpus() -> None:
+    """Manage the benchmark corpus (corpus.yaml -> instances.jsonl)."""
+
+
+@corpus.command("init")
+@click.option("--workspace", "workspace_dir", required=True, type=click.Path(),
+              help="Directory to initialize as a corpus workspace.")
+def corpus_init(workspace_dir: str) -> int:
+    """Initialize a corpus workspace (corpus.yaml + state.json + repos/)."""
+    ws = CorpusWorkspace(workspace_dir)
+    ws.init()
+    click.echo("corpus workspace initialized at %s" % ws.root)
+    click.echo("  config: %s" % ws.config_path())
+    click.echo("  state:  %s" % ws.state_path())
+    click.echo("  repos:  %s" % ws.repos_dir())
+    click.echo("  corpus: %s" % ws.instances_path())
+    click.echo(
+        "edit %s then run: cfgdrift corpus fetch --workspace %s"
+        % (ws.config_path(), ws.root)
+    )
+    return 0
+
+
+@corpus.command("fetch")
+@click.option("--workspace", "workspace_dir", required=True,
+              type=click.Path(exists=True, file_okay=False),
+              help="Corpus workspace directory.")
+@click.option("--builtin/--no-builtin", "builtin", default=True,
+              help="Enable the built-in constraint library (default: on).")
+@click.option("--constraints", "constraint_files", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Extra constraints.yaml file (repeatable; v0.6.0).")
+@click.option("--output", "output", default=None, type=click.Path(),
+              help="Output instances.jsonl (default: <workspace>/instances.jsonl).")
+@click.pass_context
+def corpus_fetch(ctx: click.Context, workspace_dir: str, builtin: bool,
+                 constraint_files: tuple, output: Optional[str]) -> int:
+    """Fetch config change pairs from repositories and export the corpus.
+
+    ``local_path`` repositories are used directly (offline / CI-safe); other
+    repositories are cloned with ``--filter=blob:none`` and updated with
+    ``git fetch``.  GitHub star filtering is best-effort (failures warn and
+    never block).  ``max_instances`` bounds the corpus (global + per-repo).
+    """
+    ws = CorpusWorkspace(workspace_dir)
+    config = CorpusConfig.load(ws.config_path())
+    state = ws.read_state()
+    extractor = ChangePairExtractor()
+    per_repo_max = max(
+        1,
+        math.ceil(config.max_instances / max(1, len(config.repositories))),
+    )
+    fetched = 0
+    parse_failures = 0
+
+    for repo in config.repositories:
+        entry = ws.repo_state(state, repo.key)
+        if repo.is_local():
+            source = LocalRepoSource(str(repo.local_path))  # type: ignore[arg-type]
+        else:
+            clone_dir = ws.repo_dir(repo.owner, repo.repo)
+            source = GitCloneSource(repo.owner, repo.repo, clone_dir)
+            if config.min_stars is not None and not entry.get("star_checked"):
+                info = GitHubApi.fetch_repo(
+                    repo.owner, repo.repo, config.effective_token()
+                )
+                if info is not None:
+                    entry["stars"] = info.get("stargazers_count")
+                    entry["star_checked"] = True
+                    stars = entry["stars"]
+                    if stars is not None and stars < config.min_stars:
+                        click.echo(
+                            "skip %s: %s stars < min_stars %s"
+                            % (repo.key, stars, config.min_stars)
+                        )
+                        continue
+                else:
+                    click.echo(
+                        "warning: star check failed for %s (best-effort, "
+                        "continuing)" % repo.key,
+                        err=True,
+                    )
+        source.clone_or_fetch()
+        entry["local_path"] = source.dir
+
+        already = int(entry.get("instance_count", 0) or 0)
+        budget = max(0, per_repo_max - already)
+        if budget <= 0:
+            click.echo("skip %s: per-repo instance cap (%d) reached" % (repo.key, per_repo_max))
+            continue
+        pairs, stats, newest = extractor.extract_repo(
+            source,
+            since=config.effective_since(repo),
+            stop_at=entry.get("last_commit"),
+            max_pairs=budget,
+            glob_pattern=repo.glob,
+        )
+        parse_failures += int(stats.get("parse_failures", 0))
+        if pairs:
+            entry["last_commit"] = newest
+            entry["instance_count"] = already + len(pairs)
+            fetched += len(pairs)
+            click.echo("fetched %d new pair(s) from %s" % (len(pairs), repo.key))
+        else:
+            click.echo("no new pairs from %s" % repo.key)
+
+    state["fetched_at"] = utcnow_iso()
+    ws.write_state(state)
+
+    constraints = _load_constraints(list(constraint_files), builtin)
+    exporter = CorpusExporter()
+    out_path = output or ws.instances_path()
+    export_stats = exporter.export(
+        ws, config, constraints=constraints, output=out_path
+    )
+    click.echo(
+        "corpus export: %d instance(s) from %d repo(s) -> %s"
+        % (export_stats["instances"], export_stats["repos"], out_path)
+    )
+    click.echo(
+        "parse failures: %d"
+        % (parse_failures + int(export_stats.get("parse_failures", 0)))
+    )
+    return 0
+
+
+@corpus.command("export")
+@click.option("--workspace", "workspace_dir", required=True,
+              type=click.Path(exists=True, file_okay=False),
+              help="Corpus workspace directory.")
+@click.option("--output", "output", default=None, type=click.Path(),
+              help="Output instances.jsonl (default: <workspace>/instances.jsonl).")
+@click.option("--builtin/--no-builtin", "builtin", default=True,
+              help="Enable the built-in constraint library (default: on).")
+@click.option("--constraints", "constraint_files", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Extra constraints.yaml file (repeatable; v0.6.0).")
+@click.pass_context
+def corpus_export(ctx: click.Context, workspace_dir: str, output: Optional[str],
+                  builtin: bool, constraint_files: tuple) -> int:
+    """Rebuild instances.jsonl from fetched state (idempotent full rewrite)."""
+    ws = CorpusWorkspace(workspace_dir)
+    config = CorpusConfig.load(ws.config_path())
+    constraints = _load_constraints(list(constraint_files), builtin)
+    out_path = output or ws.instances_path()
+    stats = CorpusExporter().export(
+        ws, config, constraints=constraints, output=out_path
+    )
+    click.echo(
+        "corpus export: %d instance(s) from %d repo(s) -> %s"
+        % (stats["instances"], stats["repos"], out_path)
+    )
+    if stats.get("parse_failures"):
+        click.echo("parse failures: %d" % stats["parse_failures"])
+    return 0
+
+
+@corpus.command("validate")
+@click.option("--workspace", "workspace_dir", required=True,
+              type=click.Path(exists=True, file_okay=False),
+              help="Corpus workspace directory.")
+@click.option("--input", "input_path", default=None, type=click.Path(),
+              help="instances.jsonl to validate (default: <workspace>/instances.jsonl).")
+def corpus_validate(workspace_dir: str, input_path: Optional[str]) -> int:
+    """Validate instances.jsonl schema and print aggregate statistics."""
+    ws = CorpusWorkspace(workspace_dir)
+    path = input_path or ws.instances_path()
+    stats = CorpusValidator.validate(path)
+    click.echo(
+        "corpus validate: %d instance(s) from %d repo(s)"
+        % (stats["instances"], len(stats["repos"]))
+    )
+    click.echo(
+        "formats: %s"
+        % ", ".join(
+            "%s=%d" % (k, v) for k, v in sorted(stats["formats"].items())
+        )
+    )
+    click.echo(
+        "changes: %s"
+        % ", ".join(
+            "%s=%d" % (k, v) for k, v in stats["changes"].items()
+        )
+    )
+    click.echo("constraint violations: %d" % stats["constraint_violations"])
+    if stats.get("parse_errors"):
+        click.echo("parse errors: %d" % stats["parse_errors"])
     return 0
 
 

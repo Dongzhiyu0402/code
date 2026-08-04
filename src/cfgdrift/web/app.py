@@ -360,6 +360,96 @@ def create_app(store, home: Optional[str] = None):
     def api_health():
         return ok({"status": "ok"})
 
+    # -- v0.7.0: constraints view (C-09) + violation events (C-10) --------
+
+    @app.get("/api/constraints")
+    def api_constraints():
+        """List the effective constraints (D6: ``resolve(home, [], True)``).
+
+        Same view as ``cfgdrift constraint list --source all``: built-in
+        library merged with user rules, same-id user rules overriding
+        built-ins.
+        """
+        from ..core.model import Severity
+        from ..rules.constraints import (
+            resolve as resolve_constraints,
+        )
+
+        try:
+            rules = resolve_constraints(home, [], builtin_enabled=True)
+        except ValueError as exc:
+            return err(str(exc))
+        constraints = []
+        for rule in rules:
+            severity = rule.severity
+            constraints.append(
+                {
+                    "id": rule.id,
+                    "type": rule.type,
+                    "keys": list(rule.keys),
+                    "severity": severity.value
+                    if isinstance(severity, Severity)
+                    else str(severity),
+                    "enabled": bool(rule.enabled),
+                    "source": rule.source,
+                    "message": rule.message,
+                }
+            )
+        return ok({"constraints": constraints})
+
+    @app.put("/api/constraints/{constraint_id}/enabled")
+    async def api_constraints_set_enabled(constraint_id: str, request: Request):
+        """Enable/disable a user constraint (built-in rules -> 400, Q5)."""
+        from ..rules.constraints import (
+            ConstraintConfig,
+            default_path as constraints_config_path,
+            resolve as resolve_constraints,
+        )
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON body
+            return err("invalid JSON body")
+        enabled = bool(body.get("enabled", True))
+        try:
+            rules = resolve_constraints(home, [], builtin_enabled=True)
+        except ValueError as exc:
+            return err(str(exc))
+        rule = next((r for r in rules if r.id == constraint_id), None)
+        if rule is None:
+            return err(
+                "constraint %r not found" % constraint_id, status=404
+            )
+        if rule.source == "builtin":
+            return err(
+                "内置约束不可直接切换；可添加同 id 用户规则覆盖", status=400
+            )
+        path = constraints_config_path(home)
+        try:
+            ConstraintConfig.set_enabled(path, constraint_id, enabled)
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        return ok({"id": constraint_id, "enabled": enabled})
+
+    @app.get("/api/constraint-events")
+    def api_constraint_events(
+        constraint_id: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ):
+        """List constraint violations with filters + pagination (C-10)."""
+        try:
+            result = store.list_constraint_violations(
+                constraint_id=constraint_id,
+                kind=kind,
+                limit=min(max(1, int(limit)), 500),
+                offset=max(0, int(offset)),
+            )
+        except ValueError as exc:
+            return err(str(exc))
+        return ok(result)
+
     # -- static ----------------------------------------------------------
 
     if os.path.isdir(_STATIC_DIR):

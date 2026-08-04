@@ -96,6 +96,34 @@ class Reporter:
                     )
                 )
 
+        # v0.7.0: pre-existing (baseline) constraint violations — only rendered
+        # when the report carries any (scan --report-violations, D3/D7).
+        baseline_violations = getattr(report, "baseline_violations", None) or []
+        if baseline_violations:
+            lines.append("Baseline violations:")
+            for violation in baseline_violations:
+                sev = violation.get("severity", "NONE")
+                tag = sev
+                if color:
+                    try:
+                        sev_obj = Severity(sev)
+                    except ValueError:
+                        sev_obj = Severity.NONE
+                    tag = "%s[%s]%s" % (
+                        _COLORS[sev_obj],
+                        sev,
+                        _RESET,
+                    )
+                cid = violation.get("constraint_id", "?")
+                ctype = violation.get("type", "?")
+                message = violation.get("message", "")
+                file = violation.get("file", "")
+                keys = ", ".join(violation.get("involved_keys") or [])
+                lines.append(
+                    "  %s constraint %s [%s]: %s (%s: %s)"
+                    % (tag, cid, ctype, message, file, keys)
+                )
+
         s = report.summary
         lines.append(
             "Summary: added=%d removed=%d modified=%d type_changed=%d "

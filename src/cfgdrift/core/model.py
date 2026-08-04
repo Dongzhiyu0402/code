@@ -295,6 +295,12 @@ class Report:
     mode: str
     summary: ScanSummary
     items: List[DriftItem] = field(default_factory=list)
+    # v0.7.0: pre-existing (baseline) constraint violations surfaced by
+    # ``scan --report-violations``.  Each element is a dict shaped
+    # ``{constraint_id, type, message, involved_keys, file, severity}``
+    # (severity is the constraint's own severity, Q6).  ``to_dict`` emits the
+    # key only when non-empty (zero-noise contract, D3).
+    baseline_violations: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         baseline_ref = None
@@ -303,7 +309,7 @@ class Report:
                 "name": self.baseline.name,
                 "version": self.baseline.version,
             }
-        return {
+        out = {
             "scan_id": self.scan_id,
             "mode": self.mode,
             "created_at": self.created_at,
@@ -311,6 +317,11 @@ class Report:
             "summary": self.summary.to_dict(),
             "items": [item.to_dict() for item in self.items],
         }
+        if self.baseline_violations:
+            out["baseline_violations"] = [
+                dict(v) for v in self.baseline_violations
+            ]
+        return out
 
     def to_json(self) -> str:
         return json.dumps(
