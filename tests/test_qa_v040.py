@@ -218,8 +218,10 @@ def make_dispatcher(rules, state_path, cfg_home, attempts=1, sleep_fn=noop_sleep
 class TestRegressionV020:
     def test_version_strings(self):
         assert __version__ == "0.5.0"
-        import cfgdrift._cfgdrift as c
-
+        try:
+            import cfgdrift._cfgdrift as c
+        except ImportError:  # pragma: no cover - pure-Python installs
+            pytest.skip("C extension not available (cfgdrift._cfgdrift)")
         assert c.version() == "0.5.0-c"
 
     def test_semantic_diff_still_works(self, tmp_path):

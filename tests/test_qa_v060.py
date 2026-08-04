@@ -854,7 +854,10 @@ class TestRegression:
 
     def test_version_contract(self):
         import cfgdrift
-        from cfgdrift import _cfgdrift
+        try:
+            from cfgdrift import _cfgdrift
+        except ImportError:  # pragma: no cover - pure-Python installs
+            pytest.skip("C extension not available (cfgdrift._cfgdrift)")
 
         assert cfgdrift.__version__ == "0.5.0"
         assert _cfgdrift.version() == "0.5.0-c"

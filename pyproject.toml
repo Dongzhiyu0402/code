@@ -35,7 +35,9 @@ dev = [
     # Web 仪表盘测试所需（v0.4.0+）：让 dev 环境与 CI 矩阵一次装齐
     "fastapi>=0.110",
     "uvicorn>=0.27",
-    "httpx2",
+    # httpx2 在 PyPI 上要求 Python >= 3.10（v2.0+）；py3.8 矩阵必须跳过，
+    # 否则 pip 在 3.8 上找不到兼容版本（CI install 阶段 exit 1）。
+    'httpx2>=2.0; python_version >= "3.10"',
 ]
 
 [project.scripts]

@@ -53,7 +53,10 @@ requires_c = pytest.mark.skipif(
 from cfgdrift.core import parser as parser_mod  # noqa: E402
 from cfgdrift.core import pure_parsers  # noqa: E402
 
-_PY38 = r"C:/Users/20713/AppData/Local/Programs/Python/Python38/python.exe"
+# v0.2.0 时代用本机 py3.8 解释器做双 Python 验证（configparser 严格行为 /
+# tomli 回退）。GitHub Actions ubuntu 容器没有本机路径，因此改为环境变量守卫：
+# 开发者本机设置 CFGDRIFT_TEST_PY38=/path/to/python3.8 时启用，CI 上未设置则整组 skip。
+_PY38 = os.environ.get("CFGDRIFT_TEST_PY38", "")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -105,10 +108,15 @@ def _both_backends_parse(fmt, text):
 
 
 def _both_backends_reject(fmt, text):
-    """Assert both backends raise ValueError with the shared prefix."""
+    """Assert each available backend raises ValueError with the shared prefix.
+
+    Pure-mode installs (no C extension) only exercise the pure backend; the
+    dual-mode contract is verified when ``_cfgdrift`` is importable.
+    """
     original = parser_mod.PARSER_BACKEND
+    backends = ("c", "pure") if HAVE_C else ("pure",)
     try:
-        for backend in ("c", "pure"):
+        for backend in backends:
             parser_mod.set_backend(backend)
             with pytest.raises(ValueError) as exc:
                 parser_mod.parse_text(text, fmt)
@@ -183,9 +191,10 @@ class TestBackendEnvironment:
             assert parser_mod.set_backend("pure") == "pure"
             assert parser_mod.PARSER_BACKEND == "pure"
             assert parser_mod.parse_text('{"a": 1}', "json") == {"a": 1}
-            assert parser_mod.set_backend("c") == ("c" if HAVE_C else "pure")
-            assert parser_mod.PARSER_BACKEND == ("c" if HAVE_C else "pure")
-            assert parser_mod.parse_text('{"a": 1}', "json") == {"a": 1}
+            if HAVE_C:
+                assert parser_mod.set_backend("c") == "c"
+                assert parser_mod.PARSER_BACKEND == "c"
+                assert parser_mod.parse_text('{"a": 1}', "json") == {"a": 1}
             with pytest.raises(RuntimeError):
                 parser_mod.set_backend("nonsense")
         finally:
@@ -405,11 +414,12 @@ def test_set_backend_c_without_c_raises(monkeypatch):
 
 
 def _py38_available():
-    return os.path.exists(_PY38)
+    return bool(_PY38) and os.path.exists(_PY38)
 
 
 requires_py38 = pytest.mark.skipif(
-    not _py38_available(), reason="system Python 3.8 not found at %s" % _PY38
+    not _py38_available(),
+    reason="py3.8 not on this runner (set CFGDRIFT_TEST_PY38 to enable)",
 )
 
 
