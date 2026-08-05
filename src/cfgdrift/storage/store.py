@@ -87,10 +87,16 @@ CREATE TABLE IF NOT EXISTS alert_events (
     error       TEXT,
     attempts    INTEGER NOT NULL DEFAULT 1,
     fingerprint TEXT,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    -- v0.9.0 (D4): retry bookkeeping — ``retried=1`` marks a new event that
+    -- was produced by retrying an earlier event (``retried_from`` = its id).
+    retried      INTEGER NOT NULL DEFAULT 0,
+    retried_from INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_scans_created ON scans(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scans_severity ON scans(max_severity);
+CREATE INDEX IF NOT EXISTS idx_scans_mode ON scans(mode);
 CREATE INDEX IF NOT EXISTS idx_scan_items_scan ON scan_items(scan_id);
 CREATE INDEX IF NOT EXISTS idx_alert_events_created ON alert_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_events_rule ON alert_events(rule);
@@ -158,6 +164,21 @@ class Store:
         ]
         if "line_maps" not in columns:
             self._conn.execute("ALTER TABLE baselines ADD COLUMN line_maps TEXT")
+        # v0.9.0 (D4): idempotent migration for the alert_events ``retried`` /
+        # ``retried_from`` columns on pre-v0.9.0 databases.
+        alert_columns = [
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(alert_events)")
+        ]
+        if "retried" not in alert_columns:
+            self._conn.execute(
+                "ALTER TABLE alert_events ADD COLUMN retried "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "retried_from" not in alert_columns:
+            self._conn.execute(
+                "ALTER TABLE alert_events ADD COLUMN retried_from INTEGER"
+            )
         self._conn.commit()
 
     @staticmethod
@@ -363,6 +384,37 @@ class Store:
             return None
         return json.dumps(value, ensure_ascii=False)
 
+    def _scan_row_to_dict(self, r: sqlite3.Row) -> Dict[str, Any]:
+        """Assemble a compact scan dict from a scans row.
+
+        Single assembly path shared by ``list_scans`` and ``list_scans_paged``
+        so the two endpoints can never drift apart (v0.9.0, D2).
+        """
+        baseline = None
+        if r["baseline_id"] is not None:
+            brow = self._conn.execute(
+                "SELECT name, version FROM baselines WHERE id = ?",
+                (r["baseline_id"],),
+            ).fetchone()
+            if brow is not None:
+                baseline = {"name": brow["name"], "version": brow["version"]}
+        return {
+            "scan_id": int(r["id"]),
+            "baseline_id": r["baseline_id"],
+            "mode": r["mode"],
+            "created_at": r["created_at"],
+            "baseline": baseline,
+            "summary": {
+                "added": int(r["added"]),
+                "removed": int(r["removed"]),
+                "modified": int(r["modified"]),
+                "type_changed": int(r["type_changed"]),
+                "ignored": int(r["ignored"]),
+                "total": int(r["total"]),
+                "max_severity": r["max_severity"],
+            },
+        }
+
     def list_scans(self, limit: int = 50) -> List[Dict[str, Any]]:
         """Return the most recent scans as compact dicts."""
         rows = self._conn.execute(
@@ -371,35 +423,72 @@ class Store:
             "FROM scans ORDER BY id DESC LIMIT ?",
             (int(limit),),
         ).fetchall()
-        out = []
-        for r in rows:
-            baseline = None
-            if r["baseline_id"] is not None:
-                brow = self._conn.execute(
-                    "SELECT name, version FROM baselines WHERE id = ?",
-                    (r["baseline_id"],),
-                ).fetchone()
-                if brow is not None:
-                    baseline = {"name": brow["name"], "version": brow["version"]}
-            out.append(
-                {
-                    "scan_id": int(r["id"]),
-                    "baseline_id": r["baseline_id"],
-                    "mode": r["mode"],
-                    "created_at": r["created_at"],
-                    "baseline": baseline,
-                    "summary": {
-                        "added": int(r["added"]),
-                        "removed": int(r["removed"]),
-                        "modified": int(r["modified"]),
-                        "type_changed": int(r["type_changed"]),
-                        "ignored": int(r["ignored"]),
-                        "total": int(r["total"]),
-                        "max_severity": r["max_severity"],
-                    },
-                }
+        return [self._scan_row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _escape_like(text: str) -> str:
+        """Escape LIKE metacharacters so user input matches literally (D2)."""
+        return (
+            str(text)
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
+    def list_scans_paged(
+        self,
+        q: Optional[str] = None,
+        severity: Optional[str] = None,
+        mode: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """Return ``{"scans": [ScanCompact...], "total": N}`` (v0.9.0, P0-1).
+
+        ``q`` does a case-insensitive LIKE match against scan id / mode /
+        baseline name (left-joined); LIKE metacharacters are escaped so user
+        input never acts as a wildcard.  ``severity`` / ``mode`` are exact
+        equality filters.  Ordering matches ``list_scans`` (``id DESC``);
+        ``limit`` / ``offset`` page the result.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        if q:
+            # A leading ``#`` is a natural way to search for a scan id
+            # (the timeline shows rows as ``#1293``); strip it so the id
+            # field (``CAST(id AS TEXT)`` = ``"1293"``) actually matches.
+            pattern = "%" + Store._escape_like(str(q).lstrip("#")) + "%"
+            clauses.append(
+                "(LOWER(CAST(s.id AS TEXT)) LIKE ? ESCAPE '\\' OR "
+                "LOWER(s.mode) LIKE ? ESCAPE '\\' OR "
+                "LOWER(b.name) LIKE ? ESCAPE '\\')"
             )
-        return out
+            params += [pattern, pattern, pattern]
+        if severity:
+            clauses.append("s.max_severity = ?")
+            params.append(str(severity))
+        if mode:
+            clauses.append("s.mode = ?")
+            params.append(str(mode))
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        join = "LEFT JOIN baselines b ON b.id = s.baseline_id"
+
+        total_row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM scans s %s %s" % (join, where), params
+        ).fetchone()
+        total = int(total_row["c"])
+
+        rows = self._conn.execute(
+            "SELECT s.id, s.baseline_id, s.mode, s.created_at, s.added, "
+            "s.removed, s.modified, s.type_changed, s.ignored, s.total, "
+            "s.max_severity FROM scans s %s %s "
+            "ORDER BY s.id DESC LIMIT ? OFFSET ?" % (join, where),
+            params + [int(limit), int(offset)],
+        ).fetchall()
+        return {
+            "scans": [self._scan_row_to_dict(r) for r in rows],
+            "total": total,
+        }
 
     def get_scan(self, scan_id: int) -> Dict[str, Any]:
         """Return the full stored report for a scan; raises ValueError."""
@@ -523,8 +612,8 @@ class Store:
         """
         cur = self._conn.execute(
             "INSERT INTO alert_events (rule, baseline, severity, status, "
-            "target, drift_count, error, attempts, fingerprint, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "target, drift_count, error, attempts, fingerprint, created_at, "
+            "retried, retried_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 str(event.get("rule", "")),
                 str(event.get("baseline", "")),
@@ -536,6 +625,8 @@ class Store:
                 int(event.get("attempts", 1)),
                 event.get("fingerprint"),
                 event.get("created_at") or utcnow_iso(),
+                int(event.get("retried", 0) or 0),
+                event.get("retried_from"),
             ),
         )
         self._conn.commit()
@@ -578,12 +669,25 @@ class Store:
 
         rows = self._conn.execute(
             "SELECT id, rule, baseline, severity, status, target, drift_count, "
-            "error, attempts, fingerprint, created_at FROM alert_events %s "
+            "error, attempts, fingerprint, created_at, retried, retried_from "
+            "FROM alert_events %s "
             "ORDER BY id DESC LIMIT ? OFFSET ?" % where,
             params + [int(limit), int(offset)],
         ).fetchall()
         events = [dict(r) for r in rows]
         return {"events": events, "total": total}
+
+    def get_alert_event(self, event_id: int) -> Dict[str, Any]:
+        """Return one alert event row as a dict; raises ValueError (D4)."""
+        row = self._conn.execute(
+            "SELECT id, rule, baseline, severity, status, target, drift_count, "
+            "error, attempts, fingerprint, created_at, retried, retried_from "
+            "FROM alert_events WHERE id = ?",
+            (int(event_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("alert event %d not found" % event_id)
+        return dict(row)
 
     def count_alert_events(self) -> int:
         """Total number of recorded alert events."""

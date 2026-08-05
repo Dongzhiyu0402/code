@@ -103,12 +103,12 @@ def _diff(old, new, constraints=None, files=("app.json",)):
 class TestVersionContract:
     def test_module_version(self):
         import cfgdrift
-        assert cfgdrift.__version__ == "0.8.0"
+        assert cfgdrift.__version__ == "0.9.0"
 
     def test_cli_version_output(self, tmp_path):
         r = _run_cli(tmp_path / "home", ["--version"])
         assert r.returncode == 0
-        assert "0.8.0" in r.stdout
+        assert "0.9.0" in r.stdout
 
     def test_c_extension_version_when_available(self):
         # The C parser is compiled on some platforms; when present its
@@ -119,7 +119,7 @@ class TestVersionContract:
         csrc = getattr(parser_mod, "_csrc", None)
         if csrc is None:
             pytest.skip("C parser backend not active in this environment")
-        assert csrc.version() == "0.8.0-c"
+        assert csrc.version() == "0.9.0-c"
 
 
 # ---------------------------------------------------------------------------

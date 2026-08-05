@@ -124,28 +124,98 @@ function stat(label, num, cls) {
   return '<div class="stat"><div class="num ' + cls + '">' + num + '</div><div class="label">' + label + "</div></div>";
 }
 
+// v0.9.0 (P0-1): timeline search/filter/pagination state.  Module-level so
+// it survives view switches (acceptance: filters persist across views).
+const timelineState = { q: "", severity: "", mode: "", page: 0 };
+const TIMELINE_PAGE_SIZE = 20;
+
+function sevOptions(selected) {
+  return ["CRITICAL", "WARN", "INFO", "NONE"].map((s) =>
+    '<option value="' + s + '"' + (selected === s ? " selected" : "") + ">" + s + "</option>"
+  ).join("");
+}
+
+function timelineRow(sc) {
+  const s = sc.summary || {};
+  return (
+    '<tr class="scan-row" data-scan="' + sc.scan_id + '" style="cursor:pointer" title="查看报告">' +
+    "<td><strong>#" + sc.scan_id + "</strong></td>" +
+    "<td>" + fmtTime(sc.created_at) + "</td>" +
+    "<td>" + esc(sc.mode) + "</td>" +
+    "<td>" + (sc.baseline ? esc(sc.baseline.name) + " v" + sc.baseline.version : "-") + "</td>" +
+    '<td><span class="badge ' + sevClass(s.max_severity) + '">' + esc(s.max_severity) + "</span></td>" +
+    "<td>total=" + s.total + " · +" + s.added + " −" + s.removed + " · mod " + s.modified + "</td>" +
+    "</tr>"
+  );
+}
+
 async function renderTimeline() {
-  const data = await api("/api/overview");
-  const scans = data.timeline || [];
+  const params = new URLSearchParams({
+    limit: TIMELINE_PAGE_SIZE,
+    offset: timelineState.page * TIMELINE_PAGE_SIZE,
+  });
+  if (timelineState.q) params.set("q", timelineState.q);
+  if (timelineState.severity) params.set("severity", timelineState.severity);
+  if (timelineState.mode) params.set("mode", timelineState.mode);
+  const data = await api("/api/scans?" + params.toString());
+  const scans = data.scans || [];
+  const total = data.total || 0;
+  const pageCount = Math.max(1, Math.ceil(total / TIMELINE_PAGE_SIZE));
+  const start = total ? timelineState.page * TIMELINE_PAGE_SIZE + 1 : 0;
+  const end = Math.min(total, (timelineState.page + 1) * TIMELINE_PAGE_SIZE);
+
   $("#view-timeline").innerHTML =
     "<h2>时间线</h2>" +
+    '<div class="card">' +
+    '<div class="form-row">' +
+    '<input id="tlQ" placeholder="搜索 #id / 基线名 / 模式" value="' + esc(timelineState.q) + '">' +
+    '<select id="tlSev"><option value="">全部严重度</option>' + sevOptions(timelineState.severity) + "</select>" +
+    '<select id="tlMode"><option value="">全部模式</option>' +
+    '<option value="daemon"' + (timelineState.mode === "daemon" ? " selected" : "") + ">daemon</option>" +
+    '<option value="watch"' + (timelineState.mode === "watch" ? " selected" : "") + ">watch</option>" +
+    '<option value="manual"' + (timelineState.mode === "manual" ? " selected" : "") + ">manual</option>" +
+    "</select>" +
+    '<button class="action" id="tlApply">搜索</button>' +
+    "</div>" +
+    '<p class="muted">共 ' + total + " 次扫描 · 显示 " + start + "–" + end + "</p>" +
+    '<table><thead><tr><th>ID</th><th>时间</th><th>模式</th><th>基线</th><th>严重度</th><th>漂移</th></tr></thead><tbody id="tlBody">' +
     (scans.length
-      ? '<div class="card" id="timeline">' +
-        scans.map((sc) => {
-          const s = sc.summary;
-          return (
-            '<div class="scan-item" style="padding:10px 0;border-bottom:1px solid var(--border)">' +
-            '<div><strong>#' + sc.scan_id + "</strong> " + fmtTime(sc.created_at) +
-            ' <span class="muted">' + esc(sc.mode) + "</span>" +
-            (sc.baseline ? ' <span class="muted">vs ' + esc(sc.baseline.name) + " v" + sc.baseline.version + "</span>" : "") +
-            "</div>" +
-            '<div><span class="badge ' + sevClass(s.max_severity) + '">' + esc(s.max_severity) + "</span> " +
-            "total=" + s.total + " · added=" + s.added + " · removed=" + s.removed +
-            " · modified=" + s.modified + " · ignored=" + s.ignored + "</div>" +
-            "</div>"
-          );
-        }).join("") + "</div>"
-      : '<div class="card muted">暂无扫描记录，请先运行 <code>cfgdrift scan</code>。</div>');
+      ? scans.map(timelineRow).join("")
+      : '<tr><td colspan="6" class="muted">无匹配扫描</td></tr>') +
+    "</tbody></table>" +
+    '<div class="pager">' +
+    '<button id="tlPrev" ' + (timelineState.page === 0 ? "disabled" : "") + ">上一页</button>" +
+    "<span>第 " + (timelineState.page + 1) + " 页 / 共 " + pageCount + " 页</span>" +
+    '<button id="tlNext" ' + ((timelineState.page + 1) * TIMELINE_PAGE_SIZE >= total ? "disabled" : "") + ">下一页</button>" +
+    "</div></div>";
+
+  const applyFilters = () => {
+    timelineState.q = $("#tlQ").value.trim();
+    timelineState.severity = $("#tlSev").value;
+    timelineState.mode = $("#tlMode").value;
+    timelineState.page = 0;
+    renderTimeline();
+  };
+  $("#tlApply").addEventListener("click", applyFilters);
+  $("#tlQ").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") applyFilters();
+  });
+  $("#tlPrev").addEventListener("click", () => {
+    if (timelineState.page > 0) { timelineState.page -= 1; renderTimeline(); }
+  });
+  $("#tlNext").addEventListener("click", () => {
+    if ((timelineState.page + 1) * TIMELINE_PAGE_SIZE < total) {
+      timelineState.page += 1;
+      renderTimeline();
+    }
+  });
+  // v0.9.0 (P0-1): click a row -> jump to the report view (reportPreselect).
+  document.querySelectorAll("#tlBody [data-scan]").forEach((row) => {
+    row.addEventListener("click", () => {
+      reportPreselect = Number(row.dataset.scan);
+      switchView("reports");
+    });
+  });
 }
 
 async function renderSeverity() {
@@ -201,12 +271,25 @@ function renderSvgPie(dist) {
   );
 }
 
+// v0.9.0 (P0-1/P0-4): one-shot jump target for the timeline row click, and
+// the CSV export entry point.
+let reportPreselect = null;
+
 async function renderReports() {
   const data = await api("/api/overview");
   const scans = data.timeline || [];
   const options = scans.map((s) =>
     '<option value="' + s.scan_id + '">#' + s.scan_id + " " + fmtTime(s.created_at) + " (" + (s.baseline ? s.baseline.name : "no baseline") + ")</option>"
   ).join("");
+  let selectId = null;
+  if (reportPreselect !== null) {
+    // The pre-selected scan may sit beyond the 50-item overview timeline;
+    // append it as an option so the report still loads.
+    if (!scans.some((s) => s.scan_id === reportPreselect)) {
+      options += '<option value="' + reportPreselect + '">#' + reportPreselect + " (…)</option>";
+    }
+    selectId = reportPreselect;
+  }
   $("#view-reports").innerHTML =
     "<h2>报告浏览</h2>" +
     '<div class="card form-row">' +
@@ -214,12 +297,42 @@ async function renderReports() {
     '<label>严重度：<select id="reportSev"><option value="">全部</option><option>CRITICAL</option><option>WARN</option><option>INFO</option><option>NONE</option></select></label>' +
     '<button class="action" id="reportLoad">加载</button>' +
     '<button class="action" id="reportExport">导出 HTML</button>' +
+    '<button class="action" id="reportExportCsv">导出 CSV</button>' +
     "</div>" +
     '<div class="card" id="reportBody"></div>';
-  if (scans.length) {
+  if (scans.length || reportPreselect !== null) {
+    if (selectId !== null) $("#reportScan").value = selectId;
     $("#reportLoad").addEventListener("click", loadReport);
     $("#reportExport").addEventListener("click", exportReportHtml);
+    $("#reportExportCsv").addEventListener("click", exportReportCsv);
     loadReport();
+  }
+  // One-shot: clear so re-entering the view never re-jumps.
+  reportPreselect = null;
+}
+
+async function exportReportCsv() {
+  // v0.9.0 (P0-4): download the masked CSV export as a Blob (same renderer
+  // as `cfgdrift report --csv`).
+  const scanId = $("#reportScan").value;
+  try {
+    const res = await fetch("/api/reports/" + scanId + "/csv");
+    if (!res.ok) {
+      const payload = await res.json().catch(() => null);
+      throw new Error((payload && payload.message) || ("HTTP " + res.status));
+    }
+    const text = await res.text();
+    const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "report-" + scanId + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert("导出失败：" + e.message);
   }
 }
 
@@ -367,12 +480,45 @@ async function runCompare() {
     const data = await api("/api/compare", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ env1, env2 }),
+      // v0.9.0 (P0-3): use the default constraint library (built-in + user
+      // constraints.yaml); the API also accepts explicit file paths.
+      body: JSON.stringify({ env1, env2, constraints: [] }),
     });
     renderCompareResult(data, sev);
   } catch (e) {
     body.innerHTML = '<p style="color:var(--critical)">对比失败：' + esc(e.message) + "</p>";
   }
+}
+
+function constraintViolationCard(data) {
+  // v0.9.0 (P0-3): render the「约束违反」card only when the response carries
+  // the key (zero-noise: no violations -> no card, byte-identical to v0.8.0).
+  const cv = data.constraint_violations;
+  if (!cv) return "";
+  const labels = {
+    env_a: "env_a: " + (data.baseline_a || "?"),
+    env_b: "env_b: " + (data.baseline_b || "?"),
+  };
+  const groups = [];
+  for (const side of ["env_a", "env_b"]) {
+    const violations = cv[side] || [];
+    if (!violations.length) continue;
+    const rows = violations.map((v) =>
+      '<div class="cv">' +
+      '<span class="cv-id">' + esc(v.constraint_id || "?") + "</span>" +
+      '<span class="badge ' + sevClass(v.severity) + '">' + esc(v.severity || "WARN") + "</span> " +
+      "<strong>" + esc((v.involved_keys || []).join(", ") || "-") + "</strong>" +
+      (v.file ? ' <span class="muted">(' + esc(v.file) + ")</span>" : "") +
+      '<div class="muted">' + esc(v.message || "") + "</div>" +
+      "</div>"
+    ).join("");
+    groups.push(
+      '<div style="margin-bottom:6px"><span class="muted">[' + esc(labels[side]) + "]</span></div>" + rows
+    );
+  }
+  if (!groups.length) return "";
+  return '<div class="card"><h3 style="margin-bottom:10px">约束违反</h3>' +
+    groups.join('<hr style="border-color:var(--border)">') + "</div>";
 }
 
 function renderCompareResult(data, sev) {
@@ -407,6 +553,7 @@ function renderCompareResult(data, sev) {
     stat("类型变化", s.type_changed || 0, "critical") +
     "</div>" +
     '<div class="card">' + bars + "</div>" +
+    constraintViolationCard(data) +
     '<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th><th>规则</th><th>约束违反</th></tr></thead>' +
     "<tbody>" + itemRows(items) + "</tbody></table>";
 }
@@ -429,12 +576,18 @@ async function renderAlerts() {
 
   const ruleTable =
     '<div class="card"><h3 style="margin-bottom:10px">告警规则（alerts.yaml）</h3>' +
-    '<table><thead><tr><th>名称</th><th>类型</th><th>阈值</th><th>基线</th><th>状态</th></tr></thead><tbody>' +
+    '<table><thead><tr><th>名称</th><th>类型</th><th>阈值</th><th>基线</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
     (alerts.length ? alerts.map((r) =>
       "<tr><td><strong>" + esc(r.name) + "</strong></td><td>" + esc(r.type) + "</td><td>" +
       '<span class="badge ' + sevClass(r.severity) + '">' + esc(r.severity) + "</span></td><td>" +
-      esc(r.baseline || "all") + "</td><td>" + (r.enabled ? "启用" : "停用") + "</td></tr>"
-    ).join("") : '<tr><td colspan="5" class="muted">暂无告警规则（使用 <code>cfgdrift alert add</code> 添加）</td></tr>') +
+      esc(r.baseline || "all") + "</td><td>" + (r.enabled ? "启用" : "停用") +
+      "</td><td>" +
+      '<button class="action" data-alert-toggle="' + esc(r.name) + '" data-enable="' + (r.enabled ? "false" : "true") + '">' +
+      (r.enabled ? "停用" : "启用") + "</button> " +
+      '<button class="action" data-alert-test="' + esc(r.name) + '">测试发送</button>' +
+      '<span class="alert-feedback"></span>' +
+      "</td></tr>"
+    ).join("") : '<tr><td colspan="6" class="muted">暂无告警规则（使用 <code>cfgdrift alert add</code> 添加）</td></tr>') +
     "</tbody></table></div>";
 
   const eventTable =
@@ -445,16 +598,26 @@ async function renderAlerts() {
     '<select id="alertFilterSeverity"><option value="">全部严重度</option><option>CRITICAL</option><option>WARN</option><option>INFO</option><option>NONE</option></select>' +
     '<button class="action" id="alertFilterApply">筛选</button>' +
     "</div>" +
-    '<table><thead><tr><th>ID</th><th>规则</th><th>基线</th><th>严重度</th><th>状态</th><th>目标</th><th>次数</th><th>时间</th><th>错误</th></tr></thead><tbody>' +
-    (events.length ? events.map((ev) =>
-      "<tr><td>#" + ev.id + "</td><td>" + esc(ev.rule) + "</td><td>" + esc(ev.baseline) + "</td><td>" +
-      '<span class="badge ' + sevClass(ev.severity) + '">' + esc(ev.severity) + "</span></td><td>" +
-      (ev.status === "sent"
+    '<table><thead><tr><th>ID</th><th>规则</th><th>基线</th><th>严重度</th><th>状态</th><th>目标</th><th>次数</th><th>时间</th><th>错误</th><th>操作</th></tr></thead><tbody>' +
+    (events.length ? events.map((ev) => {
+      const statusBadge = ev.status === "sent"
         ? '<span class="badge b-info">sent</span>'
-        : '<span class="badge b-critical">failed</span>') +
-      "</td><td>" + esc(ev.target || "-") + "</td><td>" + ev.attempts + "</td><td>" + fmtTime(ev.created_at) + "</td><td>" +
-      (ev.error ? '<span class="event-error">' + esc(ev.error) + "</span>" : "-") + "</td></tr>"
-    ).join("") : '<tr><td colspan="9" class="muted">暂无告警事件</td></tr>') +
+        : '<span class="badge b-critical">failed</span>';
+      // v0.9.0 (P0-2): events produced by a retry carry the「重试」badge and
+      // failed rows get a one-click retry button.
+      const retryBadge = Number(ev.retried) === 1 ? ' <span class="badge b-warn">重试</span>' : "";
+      const retryBtn = ev.status === "failed"
+        ? '<button class="danger" data-retry="' + ev.id + '">重试</button>'
+        : "-";
+      return (
+        "<tr><td>#" + ev.id + "</td><td>" + esc(ev.rule) + "</td><td>" + esc(ev.baseline) + "</td><td>" +
+        '<span class="badge ' + sevClass(ev.severity) + '">' + esc(ev.severity) + "</span></td><td>" +
+        statusBadge + retryBadge +
+        "</td><td>" + esc(ev.target || "-") + "</td><td>" + ev.attempts + "</td><td>" + fmtTime(ev.created_at) + "</td><td>" +
+        (ev.error ? '<span class="event-error">' + esc(ev.error) + "</span>" : "-") +
+        "</td><td>" + retryBtn + "</td></tr>"
+      );
+    }).join("") : '<tr><td colspan="10" class="muted">暂无告警事件</td></tr>') +
     "</tbody></table>" +
     '<div class="pager">' +
     '<button id="alertPrev" ' + (alertPage === 0 ? "disabled" : "") + ">上一页</button>" +
@@ -476,6 +639,49 @@ async function renderAlerts() {
   });
   $("#alertNext").addEventListener("click", () => {
     if ((alertPage + 1) * ALERT_PAGE_SIZE < total) { alertPage += 1; renderAlerts(); }
+  });
+
+  // v0.9.0 (P0-2): enable/disable toggle (PUT) — persists to alerts.yaml.
+  document.querySelectorAll("#view-alerts [data-alert-toggle]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await api("/api/alerts/" + encodeURIComponent(btn.dataset.alertToggle) + "/enabled", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: btn.dataset.enable === "true" }),
+        });
+        renderAlerts();
+      } catch (e) {
+        alert("切换失败：" + e.message);
+      }
+    });
+  });
+  // v0.9.0 (P0-2): connectivity test (POST) — instant feedback, no event row.
+  document.querySelectorAll("#view-alerts [data-alert-test]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const fb = btn.parentNode.querySelector(".alert-feedback");
+      if (fb) { fb.textContent = "发送中…"; fb.style.color = "var(--muted)"; }
+      try {
+        const data = await api("/api/alerts/" + encodeURIComponent(btn.dataset.alertTest) + "/test", { method: "POST" });
+        if (fb) {
+          fb.textContent = data.sent ? "已发送 cfgdrift.test" : ("失败：" + (data.error || "unknown"));
+          fb.style.color = data.sent ? "var(--info)" : "var(--critical)";
+        }
+      } catch (e) {
+        if (fb) { fb.textContent = "测试失败：" + e.message; fb.style.color = "var(--critical)"; }
+      }
+    });
+  });
+  // v0.9.0 (P0-2): retry a failed event (POST) — creates a new retried row.
+  document.querySelectorAll("#view-alerts [data-retry]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await api("/api/alert-events/" + btn.dataset.retry + "/retry", { method: "POST" });
+        renderAlerts();
+      } catch (e) {
+        alert("重试失败：" + e.message);
+      }
+    });
   });
 }
 

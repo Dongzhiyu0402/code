@@ -472,6 +472,39 @@ cfgdrift explain ./config --baseline prod [--format text|json] [--schema schema.
 cfgdrift diff ./config --baseline prod --explain       # diff 末尾追加同一叙事区块
 ```
 
+---
+
+## v0.9.0 增量：时间线分页 / 告警 Web 闭环 / Web compare 对齐 CLI / 报告导出 CSV
+
+### 1. 时间线搜索 / 筛选 / 分页（P0-1）
+
+Web 时间线视图改为分页表格，支持按扫描 id / 基线名 / 模式模糊搜索（`q`）、按最高严重度（`severity`）与模式（`mode`）精确筛选，`limit`/`offset` 分页（`limit` 钳制 `[1, 500]`）。
+
+- 新端点：`GET /api/scans?q=&severity=&mode=&limit=&offset=` → `{"scans": [ScanCompact...], "total": N}`（与 `list_scans` 字段逐项一致）
+- 行点击跳转报告视图；筛选 / 页码在视图切换间保留；无匹配显示空态
+
+```bash
+curl 'http://localhost:8000/api/scans?q=prod&severity=CRITICAL&limit=20&offset=40'
+```
+
+### 2. 告警规则 Web 操作闭环（P0-2）
+
+- CLI 新增 `alert enable NAME` / `alert disable NAME`（与 Web 端点互操作，持久化到 `alerts.yaml`）
+- 新端点：
+  - `PUT /api/alerts/{name}/enabled` — body `{"enabled": bool}` → `{"name", "enabled"}`
+  - `POST /api/alerts/{name}/test` — 连通性测试（`event=cfgdrift.test`），**不写事件表** → `{"sent", "attempts", "error"}`
+  - `POST /api/alert-events/{id}/retry` — 绕过 cooldown 直接投递（payload 从事件元数据重建，无敏感值），写入一条新事件 `retried=1` / `retried_from=原 id`，原事件保留 → `{"event_id", "status", "sent", "error"}`
+
+### 3. Web compare 对齐 CLI 约束检查（P0-3）
+
+`/api/compare` 请求体新增可选 `constraints: [文件路径...]`（等价 CLI `--constraints`）；约束解析统一走 `resolve(home, constraints, builtin_enabled=True)`，默认启用内置约束库 + 用户 `constraints.yaml`。存在违反时响应携带 `constraint_violations`（`env_a` / `env_b` 分组），Web 渲染「约束违反」卡片；两环境均无违反时**不输出该键**，页面与 v0.8.0 完全一致。
+
+### 4. 报告导出 CSV（P0-4）
+
+- CLI：`cfgdrift report --scan-id N --csv out.csv`（与 `--json` / `--html` 互斥）；Web：`GET /api/reports/{id}/csv`（`text/csv` 附件，`report-{id}.csv`）
+- 同一渲染函数 `core/csvreport.py::CsvReporter.render_csv`：UTF-8 BOM + `\r\n`，10 列表头（`scan_id,severity,key_path,change_type,file,line,old_value,new_value,rule,constraint_violations`）；数据先经 `SensitiveMasker.mask_payload` 脱敏，敏感项值单元格带「(已脱敏)」标记；约束违反 id 以 `;` 连接；无漂移项仅输出表头
+- CLI 与 Web 导出内容逐字节一致
+
 - 每条漂移输出 `{key, change_type, severity, impact, evidence[], source}`；**确定性模板引擎**离线可用（内置 24+ 键语义字典 + 四类变更模板 + 约束违反/`latest` 特判/severity 兜底）
 - **LLM 增强（Q5）**：OpenAI 兼容 REST（stdlib `urllib`，`CFGDRIFT_LLM_URL/KEY/MODEL/TIMEOUT`），`temperature=0`；无 key / 超时 / HTTP 错误 / JSON 解析失败 / **证据校验失败** → 统一回退模板并标记 `source: template`
 - **证据链防幻觉（A-P0-3）**：`evidence` 只取输入事实三型（`key:` / `value:` / `constraint: …违反`）；LLM 输出经 `EvidenceValidator` 校验（evidence⊆facts、constraint_id ∈ facts、编造 key 检测），失败即整项回退

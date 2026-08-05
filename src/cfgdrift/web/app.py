@@ -114,6 +114,37 @@ def create_app(store, home: Optional[str] = None):
             }
         )
 
+    @app.get("/api/scans")
+    def api_scans(
+        q: Optional[str] = None,
+        severity: Optional[str] = None,
+        mode: Optional[str] = None,
+        limit: Optional[str] = None,
+        offset: Optional[str] = None,
+    ):
+        """Paginated scan history with search/filter (v0.9.0, P0-1).
+
+        ``q`` fuzzy-matches scan id / mode / baseline name; ``severity`` and
+        ``mode`` are exact filters; ``limit`` is clamped to [1, 500] and
+        ``offset`` must be >= 0.  Non-numeric limit/offset -> 400.
+        """
+        try:
+            limit_v = min(max(1, int(limit if limit is not None else 50)), 500)
+            offset_v = max(0, int(offset if offset is not None else 0))
+        except (TypeError, ValueError):
+            return err("limit and offset must be integers")
+        try:
+            result = store.list_scans_paged(
+                q=q or None,
+                severity=severity or None,
+                mode=mode or None,
+                limit=limit_v,
+                offset=offset_v,
+            )
+        except ValueError as exc:
+            return err(str(exc))
+        return ok(result)
+
     @app.get("/api/reports/{scan_id}")
     def api_report(scan_id: int):
         try:
@@ -158,13 +189,49 @@ def create_app(store, home: Optional[str] = None):
         )
         return Response(content=html, media_type="text/html; charset=utf-8")
 
+    @app.get("/api/reports/{scan_id}/csv")
+    def api_report_csv(scan_id: int):
+        """CSV export (v0.9.0, P0-4) — same masked data as the CLI.
+
+        Data flow (D3): ``store.get_scan`` -> ``mask_payload`` ->
+        ``CsvReporter.render_csv``, so the Web download and
+        ``cfgdrift report --csv`` are byte-identical.
+        """
+        from fastapi.responses import Response
+
+        try:
+            payload = store.get_scan(scan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if payload.get("code") != 0:
+            return err(payload.get("message", "scan report is invalid"))
+        masker.mask_payload(payload)
+        from ..core.csvreport import CsvReporter
+
+        csv_text = CsvReporter.render_csv(payload["data"])
+        return Response(
+            content=csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="report-%d.csv"'
+                % scan_id
+            },
+        )
+
     @app.post("/api/compare")
     async def api_compare(request: Request):
         """Compare two environments' baselines (v0.5.0).
 
-        Contract: ``{"env1": ..., "env2": ...}`` -> 200 with the masked
-        :class:`CompareReport` (plus per-item ``snippet_root``); 400 for
-        missing/identical environments; 404 for an uncollected baseline.
+        Contract: ``{"env1": ..., "env2": ..., "constraints": [...]}`` -> 200
+        with the masked :class:`CompareReport` (plus per-item
+        ``snippet_root``); 400 for missing/identical environments; 404 for an
+        uncollected baseline.
+
+        ``constraints`` (v0.9.0, P0-3, optional): file paths equivalent to the
+        CLI ``--constraints`` option.  Effective constraints are resolved with
+        ``rules.constraints.resolve(home, constraints, builtin_enabled=True)``
+        so Web results match ``cfgdrift compare`` (D5).  Violations are only
+        present in the response when non-empty (zero-noise contract).
         """
         try:
             body = await request.json()
@@ -178,6 +245,7 @@ def create_app(store, home: Optional[str] = None):
             return err("env1 and env2 must be different")
 
         from ..core.compare import CompareEngine
+        from ..rules.constraints import resolve as resolve_constraints
         from ..rules.severity import SeverityConfig
         from ..rules.severity import default_path as severity_config_path
 
@@ -203,12 +271,27 @@ def create_app(store, home: Optional[str] = None):
         if os.path.exists(sev_path):
             severity_rules = SeverityConfig.load(sev_path)
 
+        # v0.9.0 (P0-3, D5): resolve built-in + user + extra constraint files
+        # exactly like the CLI `compare` command.
+        raw_constraints = body.get("constraints") or []
+        if not isinstance(raw_constraints, list):
+            return err("constraints must be a list of file paths")
+        try:
+            constraints = resolve_constraints(
+                home,
+                [str(c) for c in raw_constraints],
+                builtin_enabled=True,
+            )
+        except ValueError as exc:
+            return err(str(exc))
+
         try:
             reports = engine.compare(
                 [env1, env2],
                 env_map=env_map,
                 severity_rules=severity_rules,
                 masker=masker,
+                constraints=constraints,
             )
         except ValueError as exc:
             return err(str(exc), status=404)
@@ -295,6 +378,112 @@ def create_app(store, home: Optional[str] = None):
         except ValueError as exc:
             return err(str(exc))
         return ok(result)
+
+    @app.put("/api/alerts/{name}/enabled")
+    async def api_alert_set_enabled(name: str, request: Request):
+        """Enable/disable an alert rule (v0.9.0, P0-2, D6).
+
+        Persists through ``AlertConfig.set_enabled`` (alerts.yaml), so the
+        change survives a restart and interoperates with the CLI
+        ``alert enable/disable`` commands.
+        """
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON body
+            return err("invalid JSON body")
+        if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+            return err("enabled must be a boolean")
+        path = os.path.join(home, "alerts.yaml")
+        try:
+            AlertConfig.set_enabled(path, name, body["enabled"])
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        return ok({"name": name, "enabled": body["enabled"]})
+
+    @app.post("/api/alerts/{name}/test")
+    def api_alert_test(name: str):
+        """Send a connectivity test (event=cfgdrift.test) — no event written.
+
+        v0.9.0 (P0-2): the dispatcher is built without an ``event_sink`` so a
+        test send can never touch the alert-events table.
+        """
+        from ..alert.dispatcher import AlertDispatcher
+        from ..alert.state import AlertStateStore
+
+        path = os.path.join(home, "alerts.yaml")
+        try:
+            rules = AlertConfig.list_rules(path)
+        except ValueError as exc:
+            return err(str(exc))
+        rule = next((r for r in rules if r.name == name), None)
+        if rule is None:
+            return err("alert rule %r not found" % name, status=404)
+        state = AlertStateStore(os.path.join(home, "alert_state.json"))
+        dispatcher = AlertDispatcher(rules, state, event_sink=None)
+        result = dispatcher.test_rule(rule)
+        return ok(
+            {
+                "sent": result.sent,
+                "attempts": result.attempts,
+                "error": result.error,
+            }
+        )
+
+    @app.post("/api/alert-events/{event_id}/retry")
+    def api_alert_event_retry(event_id: int):
+        """Re-deliver a failed/sent event, bypassing cooldown (v0.9.0, P0-2).
+
+        D4: the payload is rebuilt from the event row metadata (no drift
+        values -> no sensitive data), delivered through the rule's channel
+        with the rule-level retry policy, and a **new** event is recorded
+        with ``retried=1`` / ``retried_from=<original id>``.  The original
+        row is preserved.  No cooldown state is written.
+        """
+        from ..alert.dispatcher import AlertDispatcher
+        from ..alert.state import AlertStateStore
+
+        try:
+            event = store.get_alert_event(event_id)
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        path = os.path.join(home, "alerts.yaml")
+        try:
+            rules = AlertConfig.list_rules(path)
+        except ValueError as exc:
+            return err(str(exc))
+        if not any(r.name == event["rule"] for r in rules):
+            return err(
+                "alert rule %r not found" % event["rule"], status=404
+            )
+        state = AlertStateStore(os.path.join(home, "alert_state.json"))
+        dispatcher = AlertDispatcher(rules, state, event_sink=None)
+        try:
+            result = dispatcher.retry_event(event)
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        new_event_id = store.add_alert_event(
+            {
+                "rule": event["rule"],
+                "baseline": event["baseline"],
+                "severity": event["severity"],
+                "status": "sent" if result.sent else "failed",
+                "target": event["target"],
+                "drift_count": event["drift_count"],
+                "error": result.error,
+                "attempts": result.attempts,
+                "fingerprint": event["fingerprint"],
+                "retried": 1,
+                "retried_from": int(event_id),
+            }
+        )
+        return ok(
+            {
+                "event_id": new_event_id,
+                "status": "sent" if result.sent else "failed",
+                "sent": result.sent,
+                "error": result.error,
+            }
+        )
 
     @app.get("/api/daemon-status")
     def api_daemon_status():

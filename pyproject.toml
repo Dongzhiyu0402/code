@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cfgdrift"
-version = "0.8.0"
+version = "0.9.0"
 description = "Semantic-level configuration drift detection system (JSON/TOML/INI parsed in C or pure Python, YAML via PyYAML)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -58,9 +58,3 @@ cfgdrift = ["web/static/*.html", "web/static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-# pyproject.toml
-[project]
-name = "your-tool"
-version = "1.0.0"
-license = { text = "MIT" }

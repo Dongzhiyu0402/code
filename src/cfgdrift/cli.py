@@ -209,7 +209,7 @@ def _render_explain_text(
     else:
         mode = "模板模式，未配置 LLM key"
     click.echo("")
-    click.echo("%s（cfgdrift v0.8.0 · %s）" % (title, mode))
+    click.echo("%s（cfgdrift v0.9.0 · %s）" % (title, mode))
     click.echo("=" * 64)
     for i, narrative in enumerate(narratives, start=1):
         click.echo(
@@ -833,14 +833,18 @@ def compare(ctx: click.Context, environments: tuple, severity_filter: Optional[s
               help="Write the JSON report to a file.")
 @click.option("--html", "html_path", type=click.Path(), default=None,
               help="Write a single-file offline HTML report to a file (v0.5.0).")
+@click.option("--csv", "csv_path", type=click.Path(), default=None,
+              help="Write the drift items as CSV (masked) to a file (v0.9.0).")
 @click.option("--color/--no-color", default=True, help="Colored terminal output.")
 @click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
 @click.pass_context
 def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
-           html_path: Optional[str], color: bool, no_line: bool) -> int:
-    """Render a stored scan report (terminal, JSON or standalone HTML)."""
-    if json_path and html_path:
-        raise ValueError("--json and --html are mutually exclusive")
+           html_path: Optional[str], csv_path: Optional[str],
+           color: bool, no_line: bool) -> int:
+    """Render a stored scan report (terminal, JSON, CSV or standalone HTML)."""
+    formats = [p for p in (json_path, html_path, csv_path) if p]
+    if len(formats) > 1:
+        raise ValueError("--json, --html and --csv are mutually exclusive")
     store = _open_store(ctx)
     if scan_id is None:
         scans = store.list_scans(limit=1)
@@ -867,6 +871,21 @@ def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
         with open(html_path, "w", encoding="utf-8") as fh:
             fh.write(html)
         click.echo("report written to %s" % html_path)
+        return 0
+
+    if csv_path:
+        # D3: same masked data source as the Web CSV export — get_scan
+        # payload masked at the display exit, rendered by CsvReporter.
+        masker = _build_masker()
+        masker.mask_payload(payload)
+        from .core.csvreport import CsvReporter
+
+        csv_text = CsvReporter.render_csv(data)
+        # newline='': the CSV already carries \r\n line endings and the BOM;
+        # the text-mode newline translation would otherwise double the \r.
+        with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(csv_text)
+        click.echo("report written to %s" % csv_path)
         return 0
 
     summary_data = data.get("summary", {})
@@ -2509,6 +2528,28 @@ def alert_test(ctx: click.Context, name: str) -> int:
         return 0
     click.echo("alert test %r failed: %s" % (name, result.error), err=True)
     return 2
+
+
+@alert.command("enable")
+@click.argument("name")
+@click.pass_context
+def alert_enable(ctx: click.Context, name: str) -> int:
+    """Enable an alert rule by name (v0.9.0, P0-2; interoperable with Web)."""
+    path = AlertConfig.default_path(_daemon_home())
+    AlertConfig.set_enabled(path, name, True)
+    click.echo("alert rule %r enabled" % name)
+    return 0
+
+
+@alert.command("disable")
+@click.argument("name")
+@click.pass_context
+def alert_disable(ctx: click.Context, name: str) -> int:
+    """Disable an alert rule by name (v0.9.0, P0-2; interoperable with Web)."""
+    path = AlertConfig.default_path(_daemon_home())
+    AlertConfig.set_enabled(path, name, False)
+    click.echo("alert rule %r disabled" % name)
+    return 0
 
 
 # ---------------------------------------------------------------------------

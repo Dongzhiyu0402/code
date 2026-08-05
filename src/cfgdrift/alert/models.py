@@ -422,3 +422,30 @@ def build_test_payload(version: str = "0.3.0") -> Dict[str, Any]:
         ],
         "summary": "1 WARN drift(s) in baseline <test>",
     }
+
+
+def build_retry_payload(
+    event: Mapping[str, Any], version: str
+) -> Dict[str, Any]:
+    """Rebuild a delivery payload from an alert-event row (v0.9.0, D4).
+
+    Retry carries only the event metadata — severity / baseline / target /
+    drift_count — with ``drift_items=[]`` so no drift values (and therefore
+    no sensitive values) are re-transmitted.  ``summary`` is rewritten from
+    the metadata.
+    """
+    severity = str(event.get("severity", "NONE") or "NONE")
+    baseline = str(event.get("baseline", "") or "")
+    target = event.get("target")
+    count = int(event.get("drift_count", 0) or 0)
+    return {
+        "event": "cfgdrift.drift",
+        "version": version,
+        "timestamp": utcnow_iso(),
+        "severity": severity,
+        "baseline": baseline,
+        "target": target,
+        "drift_count": count,
+        "drift_items": [],
+        "summary": "%d %s drift(s) in baseline %s" % (count, severity, baseline),
+    }

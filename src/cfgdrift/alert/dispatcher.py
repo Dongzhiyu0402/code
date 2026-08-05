@@ -22,6 +22,7 @@ from .channels import Channel, ChannelError, build_channel, retry_with_backoff
 from .models import (
     AlertRule,
     build_drift_payload,
+    build_retry_payload,
     build_test_payload,
     drift_fingerprint,
 )
@@ -225,6 +226,60 @@ class AlertDispatcher:
             )
         except ChannelError as exc:
             logger.error("alert test %s failed: %s", rule.name, exc)
+            return DispatchResult(
+                rule=rule,
+                fingerprint="",
+                key="",
+                attempted=True,
+                sent=False,
+                attempts=attempts,
+                error=str(exc),
+            )
+
+    def retry_event(self, event: Mapping[str, Any]) -> DispatchResult:
+        """Deliver an alert-event row again, bypassing cooldown/thresholds.
+
+        v0.9.0 (D4): retry rebuilds the payload from the event metadata
+        (:func:`~cfgdrift.alert.models.build_retry_payload` — no drift
+        values, hence no sensitive data) and sends it through the rule's
+        channel with the rule-level retry policy.  It deliberately **never**
+        touches ``alert_state.json`` (no new cooldown), never re-evaluates
+        enabled/baseline/severity filters (the event already fired once),
+        and does not write a new event (the caller does that with
+        ``retried=1`` / ``retried_from``).
+        """
+        rule = next(
+            (r for r in self.rules if r.name == str(event.get("rule", ""))),
+            None,
+        )
+        if rule is None:
+            raise ValueError(
+                "alert rule %r not found" % str(event.get("rule", ""))
+            )
+        payload = build_retry_payload(event, self.version)
+        attempts, delays = rule.effective_retry(
+            self.retry_attempts, self.retry_delays
+        )
+        try:
+            channel = build_channel(rule)
+            used = retry_with_backoff(
+                lambda: channel.send(payload),
+                attempts=attempts,
+                delays=delays,
+                sleep_fn=self.sleep_fn,
+            )
+            logger.info("alert retry %s ok (attempts=%d)", rule.name, used)
+            return DispatchResult(
+                rule=rule,
+                fingerprint="",
+                key="",
+                attempted=True,
+                sent=True,
+                attempts=used,
+                error=None,
+            )
+        except ChannelError as exc:
+            logger.error("alert retry %s failed: %s", rule.name, exc)
             return DispatchResult(
                 rule=rule,
                 fingerprint="",

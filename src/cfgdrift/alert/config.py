@@ -139,3 +139,22 @@ class AlertConfig:
     def list_rules(path: str) -> List[AlertRule]:
         """Return all rules (empty list when the file does not exist)."""
         return AlertConfig.load(path)
+
+    @staticmethod
+    def set_enabled(path: str, name: str, enabled: bool) -> None:
+        """Enable/disable a rule by name; raises ``ValueError`` when absent.
+
+        Mirrors ``SeverityConfig.set_enabled`` / ``ConstraintConfig.set_enabled``
+        (v0.9.0, D6): load -> toggle -> save, so the Web PUT endpoint and the
+        CLI ``alert enable/disable`` commands share one write path.
+        """
+        rules = AlertConfig.load(path)
+        found = False
+        for rule in rules:
+            if rule.name == name:
+                rule.enabled = bool(enabled)
+                found = True
+                break
+        if not found:
+            raise ValueError("alert rule %r not found" % name)
+        AlertConfig.save(path, rules)
