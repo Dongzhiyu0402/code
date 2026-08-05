@@ -58,3 +58,9 @@ cfgdrift = ["web/static/*.html", "web/static/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# pyproject.toml
+[project]
+name = "your-tool"
+version = "1.0.0"
+license = { text = "MIT" }
