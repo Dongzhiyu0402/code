@@ -100,6 +100,10 @@ dist-v070/
 _dist-v070/
 dist-v080/
 
+# JOSS 投稿私人材料（不公开）
+docs/joss_paper_draft.md
+docs/paper_annotations_material.md
+
 # v0.8.0 调试/临时产物
 _qa9_*.txt
 _qa9_*.py
