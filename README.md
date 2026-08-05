@@ -511,12 +511,13 @@ cfgdrift constraint mine --json                                # 输出完整 JS
 ```bash
 cfgdrift scan PATH --baseline B --report-violations    # 默认关闭
 ```
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 - `ConstraintEngine.check_tree` 对 new_snapshot 逐文件跑全部启用约束；`baseline_violations` 与漂移关联违反按签名 `(constraint_id, file, frozenset(involved_keys))` 差集去重，severity 直取约束自身
 - terminal 输出「Baseline violations:」section（items 后、Summary 前）；json 输出 `baseline_violations` 字段；**默认关闭时与 v0.6.0 逐字节一致**；HTML 报告不渲染该 section（`htmlreport.py` 零改动）
 - C-10 写入：`scan --report-violations` 写 drift + baseline 两类；daemon 只写 drift 违反
 
 > 注意：`instances.jsonl` 由 `corpus fetch/export` 生成并**全量重写**（幂等）；`corpus fetch` 的 git 操作依赖 PATH 中的 `git` 可执行文件；离线/CI 请使用 `local_path` 本地 git 仓库。
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
