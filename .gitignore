@@ -98,6 +98,7 @@ _fix_*/
 corpus_run/
 dist-v070/
 _dist-v070/
+dist-v080/
 
 # v0.8.0 调试/临时产物
 _qa9_*.txt
