@@ -23,6 +23,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from .constraints import ConstraintEngine
 from .differ import SemanticDiffer
 from .masker import SensitiveMasker
 from .model import CompareReport, IgnoreRule, ScanSummary, SeverityRule
@@ -106,8 +107,13 @@ class CompareEngine:
         severity_rules: Optional[List[SeverityRule]] = None,
         old_lines: Optional[Dict[str, Dict[str, int]]] = None,
         new_lines: Optional[Dict[str, Dict[str, int]]] = None,
+        constraints: Optional[List[Any]] = None,  # v0.8.0 (D10)
     ) -> Tuple[List[Any], ScanSummary]:
-        """Diff two snapshots with the shared differ (v0.4.0 extensions)."""
+        """Diff two snapshots with the shared differ (v0.4.0 extensions).
+
+        ``constraints`` (v0.8.0, optional) is forwarded to the differ so the
+        diff itself attaches constraint violations to drift items.
+        """
         return self._differ.diff_snapshot(
             snapshot_a,
             snapshot_b,
@@ -115,6 +121,7 @@ class CompareEngine:
             severity_rules=severity_rules,
             old_lines=old_lines,
             new_lines=new_lines,
+            constraints=constraints,
         )
 
     def compare(
@@ -124,6 +131,7 @@ class CompareEngine:
         rules: Optional[List[IgnoreRule]] = None,
         severity_rules: Optional[List[SeverityRule]] = None,
         masker: Optional[SensitiveMasker] = None,
+        constraints: Optional[List[Any]] = None,  # v0.8.0 (D10)
     ) -> List[CompareReport]:
         """Compare ``environments[1:]`` against ``environments[0]``.
 
@@ -135,6 +143,13 @@ class CompareEngine:
         items — the display exits (terminal / JSON) pass a masker so
         ``password``-like keys never leak plaintext.  Masking mutates the
         report items only; no stored data is touched.
+
+        ``constraints`` (v0.8.0, D10, optional): when given, the engine runs
+        ``ConstraintEngine.check_tree`` against *both* environment baselines
+        and stores the per-side violations in
+        ``CompareReport.constraint_violations`` (``env_a`` = reference,
+        ``env_b`` = compared).  Violations are informational — they never
+        change the drift-based exit code (D6).
         """
         if len(environments) < 2:
             raise ValueError("compare requires at least two environments")
@@ -155,7 +170,16 @@ class CompareEngine:
                 severity_rules=severity_rules,
                 old_lines=baseline_a.line_maps,
                 new_lines=baseline_b.line_maps,
+                constraints=constraints,
             )
+            violations: Dict[str, List[dict]] = {}
+            if constraints:
+                violations["env_a"] = ConstraintEngine.check_tree(
+                    constraints, baseline_a.data
+                )
+                violations["env_b"] = ConstraintEngine.check_tree(
+                    constraints, baseline_b.data
+                )
             reports.append(
                 CompareReport(
                     baseline_a=reference_baseline_name,
@@ -165,6 +189,7 @@ class CompareEngine:
                     items=items,
                     env1_version=baseline_a.version,
                     env2_version=baseline_b.version,
+                    constraint_violations=violations,
                 )
             )
         if masker is not None:

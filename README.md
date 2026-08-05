@@ -39,7 +39,7 @@
 
 ## 安装
 
-自 v0.2.0 起（当前版本 v0.7.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
+自 v0.2.0 起（当前版本 v0.8.0）`cfgdrift` 是**任何 Python 3.8+ 均可安装运行**
 的通用包：C 扩展是可选加速器，未编译或安装失败时自动降级到纯 Python 解析器。
 
 ```bash
@@ -414,6 +414,61 @@ cfgdrift scan PATH --baseline B --report-violations    # 默认关闭
 - C-10 写入：`scan --report-violations` 写 drift + baseline 两类；daemon 只写 drift 违反
 
 > 注意：`instances.jsonl` 由 `corpus fetch/export` 生成并**全量重写**（幂等）；`corpus fetch` 的 git 操作依赖 PATH 中的 `git` 可执行文件；离线/CI 请使用 `local_path` 本地 git 仓库。
+
+
+## v0.8.0 增量：双人标注+kappa / severity×constraint_id / compare 约束闭环 / 业务影响叙事
+
+v0.8.0 在 v0.7.0 之上新增四项能力，全部以**新模块承载 + 既有接口可选参数/条件输出**接入（无新增第三方依赖；版本三处同步 `0.8.0 / 0.8.0 / 0.8.0-c`）。
+
+### 1. corpus 双人标注 + kappa（C-C5）
+
+```bash
+cfgdrift corpus annotate --workspace <dir> --annotator alice            # 交互标注（[1]severe [2]minor [3]normal [s]跳过 [q]保存退出）
+cfgdrift corpus annotate --workspace <dir> --annotator alice --batch labels.yaml   # 非交互批量导入（CI 友好）
+cfgdrift corpus kappa --workspace <dir> [--annotator-a A --annotator-b B] [--weighted linear|quadratic] [--json]
+cfgdrift corpus stats --workspace <dir> [--json]
+```
+
+- **独立存储**：标注写入 `<workspace>/annotations.jsonl`（`{instance_id, annotator, annotation, annotated_at}`，3 分类序数 `severe|minor|normal`），与 `instances.jsonl` 分离——后者由 export 全量重写，独立存储防丢失
+- **export 合并（D3）**：`corpus export` 把每实例**最新一条**标注（`annotated_at` 排序，同刻按 annotator 字典序）投影进 `labels.annotation` / `labels.annotator`；**重复 export 不丢失标注**
+- **kappa（Q2）**：Cohen's kappa（`po=Σn_ii/n`、`pe=Σrow·col/n²`、`κ=(po−pe)/(1−pe)`）+ 一致率 + 混淆矩阵（行=A 列=B）；`--weighted linear|quadratic` 输出加权 kappa；无参自动配对重叠样本最多的两人（D4）；不足 2 名标注人 / 重叠 < 2 条 → exit 2
+- **stats（§6.3）**：实例总数 / 未标注 / 单标注（按人拆分）/ 双人完成 / 一致率 / kappa 可计算数
+- 模板见 `examples/annotations.jsonl.example`
+
+### 2. severity 引用 constraint_id（C-13）
+
+```bash
+cfgdrift severity add --name port-critical --severity CRITICAL --constraint-id http_port_range   # 单个或逗号分隔/多次
+cfgdrift severity list        # 输出追加 constraint=<ids>（无则 -）
+```
+
+- `SeverityRule.constraint_id`（str/list 归一化 `List[str]`）是**额外 AND 条件**：规则仅当该项关联的约束违反命中该 id 时才生效；与 `key_pattern` 等并存时全部满足才命中；文件顺序 first-match-wins 不变
+- **管线顺序（D1）**：约束 attach（只挂不升级）→ severity 覆盖（constraint_id 规则可读 `item.constraint_violations`）→ 统一升级 `min(3, max(rank+1, max_c_rank))` → summary.max_severity → 告警阈值；升级公式关于 severity 单调，**无 constraint_id 规则时与 v0.7.0 输出逐字节一致**
+- `to_dict` 仅非空输出 `constraint_id`（旧规则 yaml 字节不变）
+
+### 3. compare 跑约束（D10 补全）
+
+```bash
+cfgdrift compare dev prod --constraints my.yaml     # 自定义约束
+cfgdrift compare dev prod --no-builtin              # 关闭内置约束库
+cfgdrift compare dev prod --json                    # constraint_violations 进 JSON
+```
+
+- `CompareReport.constraint_violations`：`{"env_a": [...], "env_b": [...]}`（`check_tree` 形状，severity 直取约束）；terminal 在 items 后、Summary 前渲染「约束检查 (D10 补全)」区块（**仅非空**）
+- 违反为**信息性**：exit code 保持 drift-based（0/1/2 语义不变，D6）；无违反时输出与 v0.7.0 逐字节一致
+
+### 4. 业务影响叙事（方向 A）
+
+```bash
+cfgdrift explain ./config --baseline prod [--format text|json] [--schema schema.yaml] [--no-llm]
+cfgdrift diff ./config --baseline prod --explain       # diff 末尾追加同一叙事区块
+```
+
+- 每条漂移输出 `{key, change_type, severity, impact, evidence[], source}`；**确定性模板引擎**离线可用（内置 24+ 键语义字典 + 四类变更模板 + 约束违反/`latest` 特判/severity 兜底）
+- **LLM 增强（Q5）**：OpenAI 兼容 REST（stdlib `urllib`，`CFGDRIFT_LLM_URL/KEY/MODEL/TIMEOUT`），`temperature=0`；无 key / 超时 / HTTP 错误 / JSON 解析失败 / **证据校验失败** → 统一回退模板并标记 `source: template`
+- **证据链防幻觉（A-P0-3）**：`evidence` 只取输入事实三型（`key:` / `value:` / `constraint: …违反`）；LLM 输出经 `EvidenceValidator` 校验（evidence⊆facts、constraint_id ∈ facts、编造 key 检测），失败即整项回退
+- **脱敏（D7）**：explain 是显示出口，先 `SensitiveMasker` 脱敏再叙事，敏感值不泄漏
+- 模板见 `examples/explain_schema.yaml.example`（`{patterns: {regex: 描述}}` 用户字典 merge，用户条目优先）
 
 
 ## v0.7.0 增量：corpus 语料 / 约束挖掘 / Web 约束视图 / 存量违反报告

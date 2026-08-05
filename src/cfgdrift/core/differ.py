@@ -14,7 +14,7 @@ from .model import (
     join_path,
     type_name,
 )
-from .constraints import apply_constraints
+from .constraints import ConstraintEngine
 
 
 class SeverityEngine:
@@ -259,7 +259,7 @@ class SemanticDiffer:
         new_tree: Optional[Dict[str, Any]] = None,  # v0.6.0
         constraints: Optional[List[Any]] = None,  # v0.6.0
     ) -> Tuple[List[DriftItem], ScanSummary]:
-        """Post-process: severity override -> constraints -> ignore -> summary.
+        """Post-process: constraints attach -> severity override -> upgrade.
 
         The custom severity rules run *before* the ignore filter so that
         ``summary.max_severity`` is computed over the overridden severities
@@ -268,10 +268,20 @@ class SemanticDiffer:
         (C-06: override first, then upgrade) and before ignore filtering —
         ignored items carry their violations out of the output.  Line numbers
         are attached to the final kept items only.
+
+        v0.8.0 (D1): the order inside ``_finish`` becomes
+        ``attach -> severity override -> upgrade`` — constraints are first
+        *attached* without touching severity so custom severity rules with
+        ``constraint_id`` can read ``item.constraint_violations``; the single
+        upgrade pass then runs on the overridden severity.  Because the
+        upgrade formula is monotone in ``item.severity``, rules without
+        ``constraint_id`` produce byte-identical output to v0.7.0.
         """
+        if constraints:
+            ConstraintEngine.attach(new_tree, items, constraints)
         self._apply_custom_severity(items, severity_rules)
         if constraints:
-            apply_constraints(new_tree, items, constraints)
+            ConstraintEngine.upgrade(items, constraints)
         kept, summary = self._finalize(items, rules)
         self._attach_lines(kept, old_lines, new_lines)
         return kept, summary

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from ..core.differ import SemanticDiffer
 from ..core.parser import parse_text
 from ..core.model import Constraint
+from .annotations import AnnotationStore
 from .config import CorpusConfig, CorpusRepository, fmt_for_path
 from .fetcher import ChangePair, ChangePairExtractor, GitCloneSource, LocalRepoSource
 from .workspace import CorpusWorkspace
@@ -117,10 +118,44 @@ class CorpusExporter:
         parent = os.path.dirname(output_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
+        # v0.8.0 (D3): merge the latest annotation of each instance into the
+        # ``labels`` slot.  annotations.jsonl is the single source of truth
+        # for annotation records; instances.jsonl is only a projection, so a
+        # repeated export never loses manual labels.
+        merged = self._merge_annotations(workspace, lines)
         with open(output_path, "w", encoding="utf-8") as fh:
-            for line in lines:
+            for line in merged:
                 fh.write(line + "\n")
         return stats
+
+    def _merge_annotations(
+        self, workspace: CorpusWorkspace, lines: List[str]
+    ) -> List[str]:
+        """Project the latest annotation per instance into labels (D3)."""
+        if not lines:
+            return lines
+        try:
+            records = AnnotationStore(workspace).load()
+        except ValueError:
+            # A corrupt annotations.jsonl must not silently drop the corpus;
+            # surface it the same way the CLI surfaces corrupt state (exit 2).
+            raise
+        if not records:
+            return lines
+        latest = AnnotationStore.latest_by_instance(records)
+        merged: List[str] = []
+        for line in lines:
+            try:
+                instance = json.loads(line)
+            except ValueError:  # pragma: no cover - lines were just written
+                merged.append(line)
+                continue
+            annotation = latest.get(instance.get("instance_id"))
+            if annotation is not None:
+                instance.setdefault("labels", {})["annotation"] = annotation.annotation
+                instance["labels"]["annotator"] = annotation.annotator
+            merged.append(json.dumps(instance, ensure_ascii=False))
+        return merged
 
     # -- internals --------------------------------------------------------
 

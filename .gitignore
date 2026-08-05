@@ -98,3 +98,14 @@ _fix_*/
 corpus_run/
 dist-v070/
 _dist-v070/
+
+# v0.8.0 调试/临时产物
+_qa9_*.txt
+_qa9_*.py
+_pytest_ann.txt
+_pytest_batch1.txt
+_pytest_new_tests*.txt
+_pytest_v080*.txt
+_pip_install*.log
+_reg_batch_*.txt
+_e2e_v080_check.py

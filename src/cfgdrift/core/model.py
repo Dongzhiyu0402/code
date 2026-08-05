@@ -395,6 +395,11 @@ class SeverityRule:
     the change-type string (``added`` / ``removed`` / ``modified`` /
     ``type_changed``).  ``value_pattern`` is matched against the JSON
     serialization of either the old or the new value.
+
+    v0.8.0: ``constraint_id`` (optional) is an *additional* AND condition —
+    the rule only matches an item whose attached constraint violations
+    intersect this set of constraint ids (first-match-wins file order is
+    preserved; see ``docs/system_design_v080.md`` §1.2).
     """
 
     name: str
@@ -403,6 +408,7 @@ class SeverityRule:
     key_pattern: Optional[str] = None
     value_pattern: Optional[str] = None
     file_pattern: Optional[str] = None
+    constraint_id: Optional[List[str]] = None  # v0.8.0: normalized List[str]
     enabled: bool = True
 
     def __post_init__(self) -> None:
@@ -412,9 +418,30 @@ class SeverityRule:
             self.severity = Severity(str(self.severity).upper())
         if self.change_type is not None and not isinstance(self.change_type, str):
             raise ValueError("severity rule %r change_type must be a string" % self.name)
+        if self.constraint_id is not None:
+            normalized: List[str] = []
+            for cid in self.constraint_id:
+                if not isinstance(cid, str) or not cid.strip():
+                    raise ValueError(
+                        "severity rule %r constraint_id entries must be "
+                        "non-empty strings" % self.name
+                    )
+                if cid.strip() not in normalized:
+                    normalized.append(cid.strip())
+            self.constraint_id = normalized
 
-    def matches(self, item: DriftItem) -> bool:
-        """Return True when this rule applies to ``item`` (all set fields)."""
+    def matches(
+        self,
+        item: DriftItem,
+        violated_constraint_ids: Optional[set] = None,
+    ) -> bool:
+        """Return True when this rule applies to ``item`` (all set fields).
+
+        ``violated_constraint_ids`` (v0.8.0, optional) is the set of
+        constraint ids violated by ``item``; when ``None`` the set is derived
+        from ``item.constraint_violations[].constraint_id``.  ``constraint_id``
+        rules require a non-empty intersection (AND semantics).
+        """
         if not self.enabled:
             return False
         if self.change_type is not None and self.change_type != item.change_type.value:
@@ -434,6 +461,15 @@ class SeverityRule:
                     return False
             except re.error:
                 return False
+        if self.constraint_id:
+            ids = violated_constraint_ids
+            if ids is None:
+                ids = {
+                    v.get("constraint_id")
+                    for v in (getattr(item, "constraint_violations", None) or [])
+                }
+            if not (set(self.constraint_id) & set(ids)):
+                return False
         return True
 
     def _value_matches(self, item: DriftItem) -> bool:
@@ -448,7 +484,7 @@ class SeverityRule:
             return False
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "name": self.name,
             "severity": self.severity.value,
             "change_type": self.change_type,
@@ -457,6 +493,11 @@ class SeverityRule:
             "file_pattern": self.file_pattern,
             "enabled": self.enabled,
         }
+        # v0.8.0: emit constraint_id only when non-empty (zero-noise contract,
+        # old rule YAML stays byte-identical).
+        if self.constraint_id:
+            out["constraint_id"] = list(self.constraint_id)
+        return out
 
     @classmethod
     def from_dict(cls, data: dict) -> "SeverityRule":
@@ -471,6 +512,18 @@ class SeverityRule:
                 "severity rule %r has invalid severity %r"
                 % (name, data.get("severity"))
             ) from None
+        raw_constraint_id = data.get("constraint_id")
+        constraint_id = None
+        if raw_constraint_id is not None:
+            if isinstance(raw_constraint_id, str):
+                constraint_id = [raw_constraint_id]
+            elif isinstance(raw_constraint_id, list):
+                constraint_id = [str(c) for c in raw_constraint_id]
+            else:
+                raise ValueError(
+                    "severity rule %r 'constraint_id' must be a string or a "
+                    "list of strings" % name
+                )
         return cls(
             name=name,
             severity=severity,
@@ -478,6 +531,7 @@ class SeverityRule:
             key_pattern=data.get("key_pattern"),
             value_pattern=data.get("value_pattern"),
             file_pattern=data.get("file_pattern"),
+            constraint_id=constraint_id,
             enabled=bool(data.get("enabled", True)),
         )
 
@@ -792,9 +846,14 @@ class CompareReport:
     # by the CLI header and exported by --json; design 4.1).
     env1_version: Optional[int] = None
     env2_version: Optional[int] = None
+    # v0.8.0 (D10): constraint violations of each environment side, shaped
+    # ``{"env_a": [check_tree dict...], "env_b": [...]}``.  ``env_a`` is the
+    # reference baseline, ``env_b`` the compared one.  ``to_dict`` emits the
+    # key only when non-empty (zero-noise contract, §6.5).
+    constraint_violations: Dict[str, List[dict]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "baseline_a": self.baseline_a,
             "baseline_b": self.baseline_b,
             "created_at": self.created_at,
@@ -803,3 +862,9 @@ class CompareReport:
             "summary": self.summary.to_dict(),
             "items": [item.to_dict() for item in self.items],
         }
+        if any(self.constraint_violations.values()):
+            out["constraint_violations"] = {
+                side: [dict(v) for v in violations]
+                for side, violations in self.constraint_violations.items()
+            }
+        return out

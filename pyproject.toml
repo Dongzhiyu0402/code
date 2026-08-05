@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cfgdrift"
-version = "0.7.0"
+version = "0.8.0"
 description = "Semantic-level configuration drift detection system (JSON/TOML/INI parsed in C or pure Python, YAML via PyYAML)"
 readme = "README.md"
 requires-python = ">=3.8"

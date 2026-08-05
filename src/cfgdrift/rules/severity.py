@@ -166,9 +166,14 @@ def make_rule(
     key_pattern: Optional[str] = None,
     value_pattern: Optional[str] = None,
     file_pattern: Optional[str] = None,
+    constraint_id: Optional[object] = None,  # v0.8.0: str | List[str]
     enabled: bool = True,
 ) -> SeverityRule:
-    """Construct a validated :class:`SeverityRule` (CLI helper)."""
+    """Construct a validated :class:`SeverityRule` (CLI helper).
+
+    ``constraint_id`` (v0.8.0, optional) is a single constraint id string or
+    a list of them; it is normalized to ``List[str]`` by the model.
+    """
     if severity not in _VALID_SEVERITIES:
         raise ValueError(
             "invalid severity %r (expected one of: %s)"
@@ -189,6 +194,16 @@ def make_rule(
     _validate_regex("key_pattern", key_pattern)
     _validate_regex("value_pattern", value_pattern)
     _validate_regex("file_pattern", file_pattern)
+    normalized_constraint_id: Optional[List[str]] = None
+    if constraint_id is not None:
+        if isinstance(constraint_id, str):
+            normalized_constraint_id = [constraint_id]
+        elif isinstance(constraint_id, (list, tuple)):
+            normalized_constraint_id = [str(c) for c in constraint_id]
+        else:
+            raise ValueError(
+                "constraint_id must be a string or a list of strings"
+            )
     return SeverityRule(
         name=name,
         severity=Severity(severity),
@@ -196,5 +211,6 @@ def make_rule(
         key_pattern=key_pattern,
         value_pattern=value_pattern,
         file_pattern=file_pattern,
+        constraint_id=normalized_constraint_id,
         enabled=enabled,
     )

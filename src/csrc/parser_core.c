@@ -156,7 +156,7 @@ static PyObject* _cfgdrift_version(PyObject* self, PyObject* args)
 {
     (void)self;
     (void)args;
-    return PyUnicode_FromString("0.7.0-c");
+    return PyUnicode_FromString("0.8.0-c");
 }
 
 static PyMethodDef _cfgdrift_methods[] = {

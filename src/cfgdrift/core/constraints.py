@@ -336,24 +336,22 @@ class ConstraintEngine:
         return validator(constraint, tree)
 
     @staticmethod
-    def apply(new_snapshot: Optional[dict], items: List[DriftItem],
-              constraints: Optional[List[Constraint]]) -> None:
-        """Attach violations + upgrade severities in place (D5 / Q1).
+    def attach(new_snapshot: Optional[dict], items: List[DriftItem],
+               constraints: Optional[List[Constraint]]) -> None:
+        """Attach constraint violations to drift items (no severity upgrade).
 
-        - group ``items`` by ``file``;
-        - for each file, collect the drift ``key_path`` set;
-        - evaluate every enabled constraint against that file's new tree;
-        - a violation is *associated* when ``involved_keys ∩ drift_keys`` is
-          non-empty, and is attached to every drift item whose ``key_path``
-          is in ``involved_keys``;
-        - after all attachments, upgrade each violated item exactly once.
+        v0.8.0 (D1): this is the first half of the old :meth:`apply` — it
+        only associates violations with drift items whose ``key_path`` is in
+        ``involved_keys``.  Severity is left untouched so custom severity
+        rules (including ``constraint_id`` ones) can read
+        ``item.constraint_violations`` before the single :meth:`upgrade`
+        pass.
         """
         if not constraints or not items:
             return
         enabled = [c for c in constraints if c.enabled]
         if not enabled:
             return
-        constraints_by_id: Dict[str, Constraint] = {c.id: c for c in enabled}
 
         by_file: Dict[str, List[DriftItem]] = {}
         for item in items:
@@ -384,9 +382,38 @@ class ConstraintEngine:
                                 violation.to_dict()
                             )
 
+    @staticmethod
+    def upgrade(items: List[DriftItem],
+                constraints: Optional[List[Constraint]]) -> None:
+        """Upgrade each violated item exactly once (Q1).
+
+        v0.8.0 (D1): this is the second half of the old :meth:`apply` — the
+        severity formula ``min(3, max(item.rank+1, max(c.rank)))`` is
+        monotone in ``item.severity``, so running it *after* the custom
+        severity override produces the same result as v0.7.0 for rules
+        without ``constraint_id``.
+        """
+        if not constraints or not items:
+            return
+        enabled = [c for c in constraints if c.enabled]
+        if not enabled:
+            return
+        constraints_by_id: Dict[str, Constraint] = {c.id: c for c in enabled}
         for item in items:
             if item.constraint_violations:
                 ConstraintEngine._upgrade(item, constraints_by_id)
+
+    @staticmethod
+    def apply(new_snapshot: Optional[dict], items: List[DriftItem],
+              constraints: Optional[List[Constraint]]) -> None:
+        """Attach violations + upgrade severities in place (D5 / Q1).
+
+        v0.8.0: kept as ``attach + upgrade`` for backward compatibility with
+        existing callers (tests / plugins); the differ now drives the two
+        halves separately so severity rules can read violations in between.
+        """
+        ConstraintEngine.attach(new_snapshot, items, constraints)
+        ConstraintEngine.upgrade(items, constraints)
 
     @staticmethod
     def _upgrade(item: DriftItem, constraints_by_id: Dict[str, Constraint]) -> None:

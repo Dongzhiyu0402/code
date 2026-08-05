@@ -1,0 +1,16 @@
+# User key-semantics dictionary for `cfgdrift explain` (v0.8.0, D8).
+#
+# Merge semantics: entries here are matched *before* the built-in 24+ pattern
+# dictionary and a user entry with the same regex replaces the built-in
+# description.  Each key is a regex matched (case-insensitive) against the
+# drift key_path; the first match wins.
+#
+#   cfgdrift explain ./config --baseline prod --schema explain_schema.yaml
+
+version: 1
+patterns:
+  # Override a built-in semantic.
+  port: 自定义端口语义
+  # Brand-new semantic for an application-specific key.
+  myapp_redis: Redis 缓存配置
+  k8s_namespace: Kubernetes 命名空间

@@ -27,6 +27,12 @@ from .core.masker import SensitiveMasker, masking_config_path
 from .core.model import Constraint, IgnoreRule, Report, ScanSummary, Severity
 from .core.parser import parse_file, validate_format
 from .core.reporter import Reporter
+from .corpus.annotations import (
+    ANNOTATION_VALUES,
+    DEFAULT_CATEGORIES,
+    AnnotationStore,
+    KappaCalculator,
+)
 from .corpus.config import CorpusConfig
 from .corpus.exporter import CorpusExporter
 from .corpus.fetcher import (
@@ -40,6 +46,9 @@ from .corpus.workspace import CorpusWorkspace
 from .daemon.autostart import AutostartManager
 from .daemon.daemon import DaemonManager
 from .daemon.worker import main as worker_main
+from .explain.engine import ExplainEngine
+from .explain.llm import OpenAICompatBackend
+from .explain.templates import NarrativeItem, merge_schema
 from .rules.constraints import (
     ConstraintConfig,
     default_path as constraints_config_path,
@@ -119,6 +128,131 @@ def _load_constraints(
     )
 
 
+def _load_schema(schema_path: Optional[str]) -> Optional[dict]:
+    """Load a user key-semantics dictionary ``{patterns: {regex: 描述}}``."""
+    if not schema_path:
+        return None
+    import yaml
+
+    with open(schema_path, "r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError("explain schema must be a mapping at %s" % schema_path)
+    patterns = data.get("patterns")
+    if patterns is None:
+        return None
+    if not isinstance(patterns, dict):
+        raise ValueError("explain schema 'patterns' must be a mapping")
+    return {str(regex): str(desc) for regex, desc in patterns.items()}
+
+
+def _load_drift_items(
+    ctx: click.Context,
+    path: str,
+    fmt: str,
+    baseline_name: str,
+    constraints: Optional[List[Constraint]],
+):
+    """Read-only diff of ``path`` against a baseline (no DB writes, D6.9).
+
+    Returns ``(items, summary)`` — the same pipeline as ``diff`` but without
+    recording a scan.  Used by ``explain`` and ``diff --explain``.
+    """
+    store = _open_store(ctx)
+    try:
+        snapshot, line_maps = _SCANNER.scan_path_with_lines(path, fmt)
+        baseline = store.get_baseline(baseline_name)
+        rules = store.list_rules(baseline.id)
+        severity_rules = _load_severity_rules()
+        items, summary = _DIFFER.diff_snapshot(
+            baseline.data,
+            snapshot,
+            rules,
+            severity_rules=severity_rules,
+            old_lines=baseline.line_maps,
+            new_lines=line_maps,
+            constraints=constraints,
+        )
+        return items, summary
+    finally:
+        store.close()
+
+
+def _masked_item_dicts(items, masker: SensitiveMasker) -> List[dict]:
+    """Build masked item dicts for the explain display exit (D7)."""
+    out: List[dict] = []
+    for item in items:
+        data = item.to_dict()
+        masker.mask_item(data)
+        out.append(data)
+    return out
+
+
+def _build_llm_backend(llm_enabled: Optional[bool]) -> Optional[OpenAICompatBackend]:
+    """Build the LLM backend when enabled (default: auto by CFGDRIFT_LLM_KEY)."""
+    use_llm = llm_enabled if llm_enabled is not None else bool(
+        os.environ.get("CFGDRIFT_LLM_KEY", "").strip()
+    )
+    if not use_llm:
+        return None
+    return OpenAICompatBackend()
+
+
+def _render_explain_text(
+    narratives: List[NarrativeItem], title: str = "漂移业务影响分析"
+) -> None:
+    """Render narratives as a terminal block (PRD §4.3 wireframe)."""
+    if not narratives:
+        return
+    if any(n.source == "llm" for n in narratives):
+        mode = "LLM 增强模式"
+    else:
+        mode = "模板模式，未配置 LLM key"
+    click.echo("")
+    click.echo("%s（cfgdrift v0.8.0 · %s）" % (title, mode))
+    click.echo("=" * 64)
+    for i, narrative in enumerate(narratives, start=1):
+        click.echo(
+            "[%d] %s  (%s, %s)"
+            % (i, narrative.key, narrative.change_type.upper(), narrative.severity)
+        )
+        click.echo("    impact: %s" % narrative.impact)
+        click.echo("    evidence:")
+        for evidence in narrative.evidence:
+            click.echo("      - %s" % evidence)
+        click.echo("    source: %s" % narrative.source)
+
+
+def _run_explain(
+    ctx: click.Context,
+    path: str,
+    fmt: str,
+    baseline_name: str,
+    schema_dict: Optional[dict],
+    llm_backend: Optional[OpenAICompatBackend],
+    constraints: Optional[List[Constraint]],
+    masker: SensitiveMasker,
+    title: str = "漂移业务影响分析",
+    items=None,
+) -> None:
+    """Shared explain pipeline: read-only diff -> mask -> generate -> render.
+
+    ``items`` (optional) short-circuits the read-only diff when the caller
+    already computed the drift (``diff --explain``); it is re-diffed by the
+    standalone ``explain`` command.
+    """
+    if items is None:
+        items, _ = _load_drift_items(ctx, path, fmt, baseline_name, constraints)
+    masked = _masked_item_dicts(items, masker)
+    narratives = ExplainEngine().generate(
+        masked,
+        schema_dict=schema_dict,
+        llm_backend=llm_backend,
+        allow_llm=llm_backend is not None,
+    )
+    _render_explain_text(narratives, title=title)
+
+
 # ---------------------------------------------------------------------------
 # Top-level group
 # ---------------------------------------------------------------------------
@@ -170,6 +304,9 @@ def _perform_scan(
     masker: Optional[SensitiveMasker] = None,
     constraints: Optional[List[Constraint]] = None,
     report_violations: bool = False,
+    explain: bool = False,
+    schema_dict: Optional[dict] = None,
+    llm_backend: Optional[OpenAICompatBackend] = None,
 ) -> int:
     store = _open_store(ctx)
     snapshot, line_maps = _SCANNER.scan_path_with_lines(path, fmt)
@@ -264,6 +401,14 @@ def _perform_scan(
             show_line=not no_line,
         )
     )
+    # v0.8.0 (Q6): diff --explain appends the shared narrative pipeline
+    # after the normal terminal report; exit code stays drift-based.
+    if explain and masker is not None:
+        _run_explain(
+            ctx, path, fmt, baseline_name or "",
+            schema_dict, llm_backend, constraints, masker,
+            title="漂移业务影响分析", items=items,
+        )
     if summary.total > 0:
         return 1
     return 0
@@ -451,8 +596,14 @@ def _run_compare(
     no_line: bool = False,
     json_output: bool = False,
     severity_filter: Optional[str] = None,
+    constraints: Optional[List[Constraint]] = None,
 ) -> int:
-    """Shared compare logic used by ``compare`` and ``diff --compare``."""
+    """Shared compare logic used by ``compare`` and ``diff --compare``.
+
+    ``constraints`` (v0.8.0, D10, optional) enables the per-environment
+    constraint check; violations are informational and never change the
+    drift-based exit code (D6).
+    """
     store = _open_store(ctx)
     engine = CompareEngine(store)
     env_map = engine.load_environments(_daemon_home())
@@ -466,6 +617,7 @@ def _run_compare(
             env_map=env_map,
             severity_rules=severity_rules,
             masker=masker,
+            constraints=constraints,
         )
     except ValueError as exc:
         store.close()
@@ -496,7 +648,8 @@ def _run_compare(
             items = [it for it in items if it.severity.rank >= min_rank]
         if not items:
             click.echo("  no differences")
-            continue
+            if not any(rep.constraint_violations.values()):
+                continue
         for it in items:
             sev = it.severity.value
             where = it.key_path if it.key_path else "(file)"
@@ -518,6 +671,30 @@ def _run_compare(
                     else "null",
                 )
             )
+        if any(rep.constraint_violations.values()):
+            click.echo("  --- 约束检查 (D10 补全) ---")
+            for side in ("env_a", "env_b"):
+                baseline_name = rep.baseline_a if side == "env_a" else rep.baseline_b
+                for violation in rep.constraint_violations.get(side, []):
+                    key_path = ",".join(
+                        violation.get("involved_keys") or ["(unknown)"]
+                    )
+                    click.echo(
+                        "  [%s: %s] %s %s"
+                        % (
+                            side,
+                            baseline_name,
+                            violation.get("severity", "WARN"),
+                            violation.get("constraint_id", "?"),
+                        )
+                    )
+                    click.echo(
+                        "      key_path: %s  file: %s"
+                        % (key_path, violation.get("file", "-"))
+                    )
+                    click.echo(
+                        "      message: %s" % violation.get("message", "")
+                    )
         s = rep.summary
         click.echo(
             "  Summary: added=%d removed=%d modified=%d type_changed=%d "
@@ -558,29 +735,48 @@ def _run_compare(
 @click.option("--constraints", "constraint_files", multiple=True,
               type=click.Path(exists=True, dir_okay=False),
               help="Extra constraints.yaml file (repeatable; v0.6.0).")
+@click.option("--explain", "explain_mode", is_flag=True,
+              help="Append the business-impact narrative block (v0.8.0, Q6).")
+@click.option("--schema", "schema_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="User key-semantics dictionary for --explain (yaml; v0.8.0).")
+@click.option("--llm/--no-llm", "llm_enabled", default=None,
+              help="Enable LLM narrative enhancement for --explain "
+                   "(default: auto — on when CFGDRIFT_LLM_KEY is set).")
 @click.pass_context
 def diff(ctx: click.Context, path: Optional[str], baseline_name: Optional[str],
          fmt: str, color: bool, compare_mode: bool, env1: Optional[str],
          env2: Optional[str], sensitive_keys: tuple, no_line: bool,
-         builtin: bool, constraint_files: tuple) -> int:
+         builtin: bool, constraint_files: tuple, explain_mode: bool,
+         schema_path: Optional[str], llm_enabled: Optional[bool]) -> int:
     """Diff a file/directory against a baseline and print the drift report.
 
     ``--compare`` is a v0.4.0 alias for ``cfgdrift compare ENV1 ENV2``.
     """
     ctx.obj["color"] = color
+    masker = _build_masker(list(sensitive_keys))
+    constraints = _load_constraints(list(constraint_files), builtin)
     if compare_mode:
         if not env1 or not env2:
             raise ValueError("--compare requires --env1 and --env2")
-        return _run_compare(ctx, [env1, env2], no_line=no_line)
+        if explain_mode:
+            raise ValueError(
+                "--explain is not supported with --compare; run the "
+                "standalone 'explain' command against a baseline instead"
+            )
+        return _run_compare(
+            ctx, [env1, env2], no_line=no_line, constraints=constraints,
+        )
     if not baseline_name:
         raise ValueError("--baseline is required (or use --compare)")
     if not path:
         raise ValueError("path is required (unless --compare)")
-    masker = _build_masker(list(sensitive_keys))
-    constraints = _load_constraints(list(constraint_files), builtin)
+    schema_dict = _load_schema(schema_path)
+    llm_backend = _build_llm_backend(llm_enabled)
     return _perform_scan(
         ctx, path, fmt, baseline_name, None, mode="manual",
         no_line=no_line, masker=masker, constraints=constraints,
+        explain=explain_mode, schema_dict=schema_dict, llm_backend=llm_backend,
     )
 
 
@@ -596,22 +792,33 @@ def diff(ctx: click.Context, path: Optional[str], baseline_name: Optional[str],
 @click.option("--json", "json_output", is_flag=True, help="Output JSON.")
 @click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
 @click.option("-v", "verbose", is_flag=True, help="Verbose output (accepted for parity).")
+@click.option("--builtin/--no-builtin", "builtin", default=True,
+              help="Enable the built-in constraint library (v0.8.0; default: on).")
+@click.option("--constraints", "constraint_files", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Extra constraints.yaml file (repeatable; v0.8.0).")
 @click.pass_context
 def compare(ctx: click.Context, environments: tuple, severity_filter: Optional[str],
-            json_output: bool, no_line: bool, verbose: bool) -> int:
+            json_output: bool, no_line: bool, verbose: bool,
+            builtin: bool, constraint_files: tuple) -> int:
     """Compare multiple environments' baselines against the first one.
 
     ``ENV1`` is the reference; every other environment is diffed against it.
     Environment names resolve to baselines through environments.yaml (when
     present); absent mappings use the environment name as the baseline name.
+    With ``--constraints`` / ``--no-builtin`` (v0.8.0, D10) each environment
+    side is also checked against the constraint library; violations are
+    informational and never change the exit code.
     Exit codes: 0 = no differences, 1 = differences, 2 = error.
     """
+    constraints = _load_constraints(list(constraint_files), builtin)
     return _run_compare(
         ctx,
         list(environments),
         no_line=no_line,
         json_output=json_output,
         severity_filter=severity_filter,
+        constraints=constraints,
     )
 
 
@@ -823,15 +1030,24 @@ def severity() -> None:
               help="Regex matched against old/new values (optional).")
 @click.option("--file-pattern", "file_pattern", default=None,
               help="Regex matched against the file relpath (optional).")
+@click.option("--constraint-id", "constraint_ids", multiple=True,
+              help="Constraint id to match (repeatable or comma-separated; "
+                   "v0.8.0, AND semantics).")
 @click.option("--disable", "disable", is_flag=True,
               help="Create the rule disabled (default: enabled).")
 @click.pass_context
 def severity_add(ctx: click.Context, name: str, sev: str,
                  change_type: Optional[str], key_pattern: Optional[str],
                  value_pattern: Optional[str], file_pattern: Optional[str],
-                 disable: bool) -> int:
+                 constraint_ids: tuple, disable: bool) -> int:
     """Add a severity override rule (first-match-wins, file order)."""
     path = severity_config_path(_daemon_home())
+    ids: List[str] = []
+    for value in constraint_ids:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part and part not in ids:
+                ids.append(part)
     rule = make_severity_rule(
         name=name,
         severity=sev,
@@ -839,12 +1055,14 @@ def severity_add(ctx: click.Context, name: str, sev: str,
         key_pattern=key_pattern,
         value_pattern=value_pattern,
         file_pattern=file_pattern,
+        constraint_id=ids or None,
         enabled=not disable,
     )
     SeverityConfig.add_rule(path, rule)
+    constraint_text = ",".join(rule.constraint_id) if rule.constraint_id else "-"
     click.echo(
-        "severity rule %r added (severity=%s%s)" % (
-            name, sev, "" if not disable else ", disabled")
+        "severity rule %r added (severity=%s constraint=%s%s)" % (
+            name, sev, constraint_text, "" if not disable else ", disabled")
     )
     return 0
 
@@ -859,9 +1077,10 @@ def severity_list(ctx: click.Context) -> int:
         click.echo("no severity rules")
         return 0
     for r in rules:
+        constraint_text = ",".join(r.constraint_id) if r.constraint_id else "-"
         click.echo(
             "# %s severity=%s enabled=%s change=%s key=%s value=%s file=%s "
-            "source=severity.yaml"
+            "constraint=%s source=severity.yaml"
             % (
                 r.name,
                 r.severity.value,
@@ -870,6 +1089,7 @@ def severity_list(ctx: click.Context) -> int:
                 r.key_pattern or "-",
                 r.value_pattern or "-",
                 r.file_pattern or "-",
+                constraint_text,
             )
         )
     return 0
@@ -1365,6 +1585,460 @@ def corpus_validate(workspace_dir: str, input_path: Optional[str]) -> int:
     if stats.get("parse_errors"):
         click.echo("parse errors: %d" % stats["parse_errors"])
     return 0
+
+
+# ---------------------------------------------------------------------------
+# corpus annotate / kappa / stats (v0.8.0, C-C5)
+# ---------------------------------------------------------------------------
+
+def _load_corpus_instances(ws: CorpusWorkspace) -> List[dict]:
+    """Load all instances.jsonl entries (ValueError on corrupt lines)."""
+    path = ws.instances_path()
+    if not os.path.exists(path):
+        raise ValueError(
+            "corpus instances not found: %s (run 'corpus fetch' or 'corpus "
+            "export' first)" % path
+        )
+    instances: List[dict] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except ValueError as exc:
+                raise ValueError(
+                    "corrupt instances.jsonl line %d: %s" % (line_no, exc)
+                ) from exc
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    "corrupt instances.jsonl line %d: expected a mapping" % line_no
+                )
+            instances.append(entry)
+    return instances
+
+
+def _load_batch_mapping(path: str, fmt: Optional[str]) -> dict:
+    """Load a batch labels file (yaml/json; format guessed by extension)."""
+    if fmt is None:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".json":
+            fmt = "json"
+        elif ext in (".yaml", ".yml"):
+            fmt = "yaml"
+        else:
+            raise ValueError(
+                "cannot infer batch format from %r; pass --format yaml|json" % path
+            )
+    with open(path, "r", encoding="utf-8") as fh:
+        if fmt == "json":
+            data = json.load(fh)
+        else:
+            import yaml
+
+            data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError("batch labels must be a mapping {instance_id: {...}}")
+    return data
+
+
+def _render_instance_summary(inst: dict, index: int, total: int) -> None:
+    """Render one candidate instance's diff summary (PRD §1.3 wireframe)."""
+    iid = str(inst.get("instance_id", "?"))
+    metadata = inst.get("metadata") or {}
+    file_info = inst.get("file") or {}
+    diff = inst.get("diff") or {}
+    summary = diff.get("summary") or {}
+    violations = diff.get("constraint_violations") or []
+    items = diff.get("items") or []
+
+    click.echo("[实例 %d/%d] %s" % (index, total, iid))
+    click.echo(
+        "  repo: %s/%s      file: %s"
+        % (
+            metadata.get("owner", ""),
+            metadata.get("repo", ""),
+            file_info.get("relpath", ""),
+        )
+    )
+    click.echo(
+        "  diff 项: %d   added:%d modified:%d removed:%d type_changed:%d"
+        % (
+            summary.get("total", 0),
+            summary.get("added", 0),
+            summary.get("modified", 0),
+            summary.get("removed", 0),
+            summary.get("type_changed", 0),
+        )
+    )
+    violation_ids = ", ".join(
+        sorted(
+            {
+                str(v.get("constraint_id", ""))
+                for v in violations
+                if v.get("constraint_id")
+            }
+        )
+    )
+    click.echo(
+        "  最高严重度: %s   约束违反: %d (%s)"
+        % (
+            summary.get("max_severity", "NONE"),
+            len(violations),
+            violation_ids or "-",
+        )
+    )
+    click.echo("  变更摘要:")
+    for item in items[:10]:
+        key = item.get("key_path") or "(file)"
+        old_value = item.get("old_value")
+        new_value = item.get("new_value")
+        click.echo(
+            "    [%s] %s: %s -> %s"
+            % (
+                str(item.get("change_type", "")).upper(),
+                key,
+                json.dumps(old_value, ensure_ascii=False)
+                if old_value is not None
+                else "null",
+                json.dumps(new_value, ensure_ascii=False)
+                if new_value is not None
+                else "null",
+            )
+        )
+
+
+def _annotate_interactive(
+    ws: CorpusWorkspace,
+    store: AnnotationStore,
+    instances: List[dict],
+    annotator: str,
+    skip_annotated: bool,
+) -> int:
+    """Interactive annotation loop over un-annotated instances (D5)."""
+    by_instance = store.by_instance()
+
+    def is_candidate(iid: str) -> bool:
+        records = by_instance.get(iid, [])
+        if skip_annotated:
+            return not records
+        return not any(r.annotator == annotator for r in records)
+
+    candidates = [
+        inst for inst in instances
+        if is_candidate(str(inst.get("instance_id", "")))
+    ]
+    total = len(candidates)
+    if total == 0:
+        click.echo("no instances to annotate")
+        return 0
+
+    click.echo("corpus annotate (C-C5) — 待标注: %d, 已完成: 0" % total)
+    completed = 0
+    for index, inst in enumerate(candidates, start=1):
+        iid = str(inst.get("instance_id", ""))
+        _render_instance_summary(inst, index, total)
+        click.echo("  ------------------------------------------------------------------")
+        click.echo("  该实例是否构成漂移缺陷？")
+        while True:
+            try:
+                choice = click.prompt(
+                    "[1] severe [2] minor [3] normal [s] 跳过 [q] 保存并退出",
+                    prompt_suffix="\n  > ",
+                )
+            except (EOFError, click.Abort):
+                click.echo("已保存并退出（已完成 %d 条）" % completed)
+                return 0
+            value = str(choice).strip().lower()
+            if value in ("1", "2", "3"):
+                annotation = ANNOTATION_VALUES[int(value) - 1]
+                store.add(iid, annotator, annotation)
+                completed += 1
+                stats = store.stats(instances)
+                click.echo(
+                    "已保存: annotation=%s, annotator=%s → annotations.jsonl"
+                    % (annotation, annotator)
+                )
+                click.echo(
+                    "进度: %d/%d (双人完成: %d)"
+                    % (index, total, stats["double"])
+                )
+                break
+            if value == "s":
+                click.echo("已跳过: %s" % iid)
+                break
+            if value == "q":
+                click.echo("已保存并退出（已完成 %d 条）" % completed)
+                return 0
+            click.echo("无效输入，请重试（1/2/3/s/q）")
+    click.echo("标注完成: 本轮新增 %d 条" % completed)
+    return 0
+
+
+@corpus.command("annotate")
+@click.option("--workspace", "workspace_dir", required=True,
+              type=click.Path(exists=True, file_okay=False),
+              help="Corpus workspace directory.")
+@click.option("--annotator", "annotator", required=True,
+              help="Annotator name (labels this person's records).")
+@click.option("--skip-annotated", "skip_annotated", is_flag=True,
+              help="Only annotate instances with no annotation at all.")
+@click.option("--batch", "batch_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Batch labels file (yaml/json): {instance_id: {annotation, "
+                   "annotator?, note?}} — non-interactive path (D5).")
+@click.option("--format", "fmt", default=None,
+              type=click.Choice(["yaml", "json"]),
+              help="Batch file format (default: inferred from extension).")
+def corpus_annotate(workspace_dir: str, annotator: str, skip_annotated: bool,
+                    batch_path: Optional[str], fmt: Optional[str]) -> int:
+    """Annotate corpus instances (interactive or --batch, C-C5)."""
+    ws = CorpusWorkspace(workspace_dir)
+    instances = _load_corpus_instances(ws)
+    store = AnnotationStore(ws)
+    if batch_path:
+        mapping = _load_batch_mapping(batch_path, fmt)
+        count = store.import_batch(mapping, default_annotator=annotator)
+        click.echo(
+            "batch annotate: %d annotation(s) imported (annotator=%s)"
+            % (count, annotator)
+        )
+        return 0
+    return _annotate_interactive(ws, store, instances, annotator, skip_annotated)
+
+
+@corpus.command("kappa")
+@click.option("--workspace", "workspace_dir", required=True,
+              type=click.Path(exists=True, file_okay=False),
+              help="Corpus workspace directory.")
+@click.option("--annotator-a", "annotator_a", default=None,
+              help="First annotator (default: auto-pick by overlap, D4).")
+@click.option("--annotator-b", "annotator_b", default=None,
+              help="Second annotator (default: auto-pick by overlap, D4).")
+@click.option("--weighted", "weighted", default="none",
+              type=click.Choice(["none", "linear", "quadratic"]),
+              help="Weighted kappa variant to display (default: none).")
+@click.option("--json", "json_output", is_flag=True,
+              help="Output JSON.")
+def corpus_kappa(workspace_dir: str, annotator_a: Optional[str],
+                 annotator_b: Optional[str], weighted: str,
+                 json_output: bool) -> int:
+    """Compute Cohen's kappa between two annotators (C-C5, Q2)."""
+    ws = CorpusWorkspace(workspace_dir)
+    instances = _load_corpus_instances(ws)
+    known_ids = {str(inst.get("instance_id", "")) for inst in instances}
+    store = AnnotationStore(ws)
+    all_records = store.load()
+    records = []
+    for record in all_records:
+        if record.instance_id in known_ids:
+            records.append(record)
+        else:
+            click.echo(
+                "warning: annotation for unknown instance %r ignored"
+                % record.instance_id,
+                err=True,
+            )
+    if not records:
+        raise ValueError(
+            "no annotations found; run 'corpus annotate' first"
+        )
+    annotators = sorted({r.annotator for r in records})
+    if len(annotators) < 2:
+        raise ValueError(
+            "需要至少 2 名标注人才能计算 kappa（当前: %s）"
+            % ", ".join(annotators)
+        )
+    if (annotator_a is None) != (annotator_b is None):
+        raise ValueError("--annotator-a and --annotator-b must be given together")
+    if annotator_a is not None and annotator_b is not None:
+        a, b = annotator_a, annotator_b
+        if a not in annotators or b not in annotators:
+            raise ValueError(
+                "annotators %r/%r not found (available: %s)"
+                % (a, b, ", ".join(annotators))
+            )
+    else:
+        # D4: auto-pick the pair with the most overlapping samples.
+        by_instance: Dict[str, Dict[str, str]] = {}
+        for record in records:
+            by_instance.setdefault(record.instance_id, {})[record.annotator] = (
+                record.annotation
+            )
+        pair_overlap: Dict[tuple, int] = {}
+        for i in range(len(annotators)):
+            for j in range(i + 1, len(annotators)):
+                ai, bj = annotators[i], annotators[j]
+                overlap = sum(
+                    1 for m in by_instance.values() if ai in m and bj in m
+                )
+                pair_overlap[(ai, bj)] = overlap
+        ordered = sorted(
+            pair_overlap.items(),
+            key=lambda kv: (-kv[1], kv[0][0], kv[0][1]),
+        )
+        (a, b), _ = ordered[0]
+
+    by_instance = {}
+    for record in records:
+        by_instance.setdefault(record.instance_id, {})[record.annotator] = (
+            record.annotation
+        )
+    common = sorted(
+        iid for iid, mapping in by_instance.items() if a in mapping and b in mapping
+    )
+    seq_a = [by_instance[iid][a] for iid in common]
+    seq_b = [by_instance[iid][b] for iid in common]
+    if len(common) < 2:
+        raise ValueError(
+            "需要至少 2 条双人标注实例（%s vs %s 重叠 %d 条）"
+            % (a, b, len(common))
+        )
+    result = KappaCalculator.cohen_kappa(seq_a, seq_b, DEFAULT_CATEGORIES)
+
+    if json_output:
+        payload = {
+            "code": 0,
+            "data": {
+                "annotator_a": a,
+                "annotator_b": b,
+                **result,
+            },
+            "message": "ok",
+        }
+        _echo_json(payload)
+        return 0
+
+    click.echo(
+        "Cohen's kappa = %.3f (%s vs %s, n=%d)"
+        % (result["kappa"], a, b, result["n"])
+    )
+    click.echo(
+        "一致率 = %.3f (po=%.3f, pe=%.3f)"
+        % (result["agreement_rate"], result["po"], result["pe"])
+    )
+    if weighted != "none":
+        click.echo(
+            "加权 kappa(%s) = %.3f"
+            % (weighted, result["weighted"][weighted])
+        )
+    click.echo("混淆矩阵 (行=%s, 列=%s):" % (a, b))
+    cats = list(result["confusion_matrix"].keys())
+    header = "        " + "  ".join("%-8s" % c for c in cats)
+    click.echo(header)
+    for ca in cats:
+        row = result["confusion_matrix"][ca]
+        click.echo(
+            "%-8s " % ca + "  ".join("%-8d" % row[cb] for cb in cats)
+        )
+    return 0
+
+
+@corpus.command("stats")
+@click.option("--workspace", "workspace_dir", required=True,
+              type=click.Path(exists=True, file_okay=False),
+              help="Corpus workspace directory.")
+@click.option("--json", "json_output", is_flag=True,
+              help="Output JSON.")
+def corpus_stats(workspace_dir: str, json_output: bool) -> int:
+    """Show annotation progress statistics (C-C5, §6.3)."""
+    ws = CorpusWorkspace(workspace_dir)
+    instances = _load_corpus_instances(ws)
+    store = AnnotationStore(ws)
+    stats = store.stats(instances)
+    if json_output:
+        _echo_json({"code": 0, "data": stats, "message": "ok"})
+        return 0
+    click.echo("instances          : %d" % stats["instances"])
+    click.echo("未标注             : %d" % stats["unannotated"])
+    single = stats["single"]
+    single_text = ", ".join(
+        "%s: %d" % (name, count) for name, count in sorted(single.items())
+    ) or "-"
+    click.echo(
+        "单标注             : %d (%s)" % (sum(single.values()), single_text)
+    )
+    click.echo("双人完成           : %d" % stats["double"])
+    double = stats["double"]
+    if double:
+        agreeing = int(round(stats["agreement_rate"] * double))
+        click.echo(
+            "标注一致率         : %.1f%% (%d/%d)"
+            % (stats["agreement_rate"] * 100, agreeing, double)
+        )
+    else:
+        click.echo("标注一致率         : -")
+    click.echo("kappa 可计算数     : %d" % stats["kappa_ready"])
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# explain (v0.8.0, direction A)
+# ---------------------------------------------------------------------------
+
+@cli.command("explain")
+@click.argument("path", type=click.Path(exists=True))
+@click.option("--baseline", "baseline_name", required=True,
+              help="Baseline name to diff against (read-only).")
+@click.option("--format", "fmt_out", default="text",
+              type=click.Choice(["text", "json"]),
+              help="Output format (default: text).")
+@click.option("--schema", "schema_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="User key-semantics dictionary (yaml {patterns: {regex: 描述}}).")
+@click.option("--llm/--no-llm", "llm_enabled", default=None,
+              help="Enable LLM narrative enhancement (default: auto — on when "
+                   "CFGDRIFT_LLM_KEY is set).")
+@click.option("--builtin/--no-builtin", "builtin", default=True,
+              help="Enable the built-in constraint library (default: on).")
+@click.option("--constraints", "constraint_files", multiple=True,
+              type=click.Path(exists=True, dir_okay=False),
+              help="Extra constraints.yaml file (repeatable).")
+@click.option("--sensitive-keys", "sensitive_keys", multiple=True,
+              help="Extra sensitive key stems to mask (append).")
+@click.option("--no-line", "no_line", is_flag=True,
+              help="Hide line numbers (accepted; narratives do not show lines).")
+@click.pass_context
+def explain(ctx: click.Context, path: str, baseline_name: str, fmt_out: str,
+            schema_path: Optional[str], llm_enabled: Optional[bool],
+            builtin: bool, constraint_files: tuple, sensitive_keys: tuple,
+            no_line: bool) -> int:
+    """Explain the business impact of drift items with an evidence chain.
+
+    Reuses the diff pipeline read-only (no scan is recorded) and renders one
+    narrative per drift item.  The deterministic template engine is always
+    available offline; the OpenAI-compatible LLM backend enhances narratives
+    when ``CFGDRIFT_LLM_KEY`` is set (every LLM claim is validated against
+    the input facts, falling back to the template on failure).
+    Exit codes follow the drift convention: 0 = no drift, 1 = drift, 2 = error.
+    """
+    masker = _build_masker(list(sensitive_keys))
+    constraints = _load_constraints(list(constraint_files), builtin)
+    schema_dict = _load_schema(schema_path)
+    llm_backend = _build_llm_backend(llm_enabled)
+
+    items, summary = _load_drift_items(
+        ctx, path, fmt="auto", baseline_name=baseline_name, constraints=constraints
+    )
+    masked = _masked_item_dicts(items, masker)
+    narratives = ExplainEngine().generate(
+        masked,
+        schema_dict=schema_dict,
+        llm_backend=llm_backend,
+        allow_llm=llm_backend is not None,
+    )
+    if fmt_out == "json":
+        _echo_json(
+            {
+                "code": 0,
+                "data": [n.to_dict() for n in narratives],
+                "message": "ok",
+            }
+        )
+    else:
+        _render_explain_text(narratives)
+    return 1 if summary.total > 0 else 0
 
 
 # ---------------------------------------------------------------------------
