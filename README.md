@@ -517,7 +517,3 @@ cfgdrift scan PATH --baseline B --report-violations    # 默认关闭
 - C-10 写入：`scan --report-violations` 写 drift + baseline 两类；daemon 只写 drift 违反
 
 > 注意：`instances.jsonl` 由 `corpus fetch/export` 生成并**全量重写**（幂等）；`corpus fetch` 的 git 操作依赖 PATH 中的 `git` 可执行文件；离线/CI 请使用 `local_path` 本地 git 仓库。
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
