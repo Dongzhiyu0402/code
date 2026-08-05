@@ -118,6 +118,7 @@ class DaemonWorker:
         home: Optional[str] = None,  # v0.6.0: constraints.yaml location
         builtin_enabled: bool = True,  # v0.6.0
         constraint_paths: Optional[List[str]] = None,  # v0.6.0
+        alerts_config: Optional[str] = None,  # v0.10.0: alerts.yaml reload
     ) -> None:
         self.store_path = os.path.abspath(store_path)
         self.paths = [os.path.abspath(p) for p in paths]
@@ -125,6 +126,7 @@ class DaemonWorker:
         self.baseline_name = baseline_name
         self.interval = max(1, int(interval))
         self.dispatcher = dispatcher
+        self.alerts_config = alerts_config
         self.pid_file = pid_file
         self.stop_file = stop_file
         self.info_file = info_file
@@ -155,6 +157,30 @@ class DaemonWorker:
             self.home,
             extra_paths=list(self.constraint_paths),
             builtin_enabled=self.builtin_enabled,
+        )
+
+    def _reload_alert_rules(self) -> None:
+        """Reload alerts.yaml into the dispatcher every cycle (v0.10.0, D1).
+
+        Mirrors the D9 constraint-reload pattern so a Web/CLI ``alert
+        mute/unmute`` (or rule add/remove) written while the daemon runs
+        takes effect on the next scan cycle.  A corrupt file logs a warning
+        and keeps the previous rules (never crashes the daemon); no-op when
+        there is no dispatcher or no alerts config.
+        """
+        if self.dispatcher is None or not self.alerts_config:
+            return
+        try:
+            rules = AlertConfig.load(self.alerts_config)
+        except Exception as exc:  # noqa: BLE001 - reload must never crash
+            self.log.warning(
+                "failed to reload alerts.yaml; keeping previous rules: %s",
+                exc,
+            )
+            return
+        self.dispatcher.rules = rules
+        self.log.info(
+            "alert rules reloaded (%d rule(s))", len(rules)
         )
 
     def run(self, readiness_fd: Optional[int] = None) -> int:
@@ -213,6 +239,9 @@ class DaemonWorker:
             # D9: reload constraints every cycle so `constraint add` takes
             # effect on the next scan (severity_rules stay startup-loaded).
             self._constraints = self._load_constraints()
+            # v0.10.0 (D1): reload alerts.yaml every cycle so a Web/CLI
+            # mute/unmute written mid-run takes effect without a restart.
+            self._reload_alert_rules()
             for path in self.paths:
                 self._scan_one(store, path)
         except Exception as exc:  # noqa: BLE001 - keep daemon alive
@@ -526,6 +555,7 @@ def run_with_opts(opts: Dict[str, Any]) -> int:
         home=opts.get("home"),
         builtin_enabled=opts.get("builtin", True) is not False,
         constraint_paths=opts.get("constraint_paths") or [],
+        alerts_config=opts.get("alerts_config"),
     )
     # POSIX daemonize passes a readiness fd; Windows/foreground do not.
     readiness_fd = opts.get("readiness_fd")

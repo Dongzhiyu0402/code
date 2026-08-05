@@ -91,7 +91,12 @@ CREATE TABLE IF NOT EXISTS alert_events (
     -- v0.9.0 (D4): retry bookkeeping — ``retried=1`` marks a new event that
     -- was produced by retrying an earlier event (``retried_from`` = its id).
     retried      INTEGER NOT NULL DEFAULT 0,
-    retried_from INTEGER
+    retried_from INTEGER,
+    -- v0.10.0 (P0-1): event-level ack (display-only semantics).  ``acked=1``
+    -- marks the row as confirmed in the UI; ``acked_at`` keeps the *first*
+    -- ack timestamp (repeated acks are idempotent).
+    acked        INTEGER NOT NULL DEFAULT 0,
+    acked_at     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_scans_created ON scans(created_at DESC);
@@ -178,6 +183,17 @@ class Store:
         if "retried_from" not in alert_columns:
             self._conn.execute(
                 "ALTER TABLE alert_events ADD COLUMN retried_from INTEGER"
+            )
+        # v0.10.0 (P0-1): idempotent migration for the ``acked`` /
+        # ``acked_at`` columns on pre-v0.10.0 databases (mirrors retried).
+        if "acked" not in alert_columns:
+            self._conn.execute(
+                "ALTER TABLE alert_events ADD COLUMN acked "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "acked_at" not in alert_columns:
+            self._conn.execute(
+                "ALTER TABLE alert_events ADD COLUMN acked_at TEXT"
             )
         self._conn.commit()
 
@@ -669,7 +685,8 @@ class Store:
 
         rows = self._conn.execute(
             "SELECT id, rule, baseline, severity, status, target, drift_count, "
-            "error, attempts, fingerprint, created_at, retried, retried_from "
+            "error, attempts, fingerprint, created_at, retried, retried_from, "
+            "acked, acked_at "
             "FROM alert_events %s "
             "ORDER BY id DESC LIMIT ? OFFSET ?" % where,
             params + [int(limit), int(offset)],
@@ -681,7 +698,8 @@ class Store:
         """Return one alert event row as a dict; raises ValueError (D4)."""
         row = self._conn.execute(
             "SELECT id, rule, baseline, severity, status, target, drift_count, "
-            "error, attempts, fingerprint, created_at, retried, retried_from "
+            "error, attempts, fingerprint, created_at, retried, retried_from, "
+            "acked, acked_at "
             "FROM alert_events WHERE id = ?",
             (int(event_id),),
         ).fetchone()
@@ -689,10 +707,73 @@ class Store:
             raise ValueError("alert event %d not found" % event_id)
         return dict(row)
 
+    def ack_alert_event(self, event_id: int) -> Dict[str, Any]:
+        """Mark an alert event as acknowledged (v0.10.0, P0-1).
+
+        Sets ``acked=1`` and ``acked_at`` to the *first* ack timestamp
+        (``COALESCE(acked_at, now)`` — repeated acks are idempotent and never
+        overwrite the original ack time).  Raises ``ValueError`` when the
+        event does not exist; returns the updated event row.
+        """
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            "UPDATE alert_events SET acked = 1, "
+            "acked_at = COALESCE(acked_at, ?) WHERE id = ?",
+            (now, int(event_id)),
+        )
+        self._conn.commit()
+        if cur.rowcount == 0:
+            raise ValueError("alert event %d not found" % event_id)
+        return self.get_alert_event(event_id)
+
     def count_alert_events(self) -> int:
         """Total number of recorded alert events."""
         row = self._conn.execute("SELECT COUNT(*) AS c FROM alert_events").fetchone()
         return int(row["c"])
+
+    def alert_trend(
+        self, days: int = 14, rule: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Aggregate sent/failed events per UTC day (v0.10.0, P0-2).
+
+        Returns ``{"days": [{"date", "sent", "failed"}, ...], "total": N}``.
+        ``days`` is clamped to [1, 30] (default 14); the window ends today
+        and every date in it is present (missing days are zero-filled, so the
+        frontend can always render a continuous series).  ``rule`` filters to
+        a single rule; ``None``/empty = all rules.  ``total`` is the number
+        of sent+failed events inside the window.
+        """
+        days = max(1, min(30, int(days)))
+        today = datetime.now(timezone.utc).date()
+        start_date = today - timedelta(days=days - 1)
+        start_prefix = start_date.strftime("%Y-%m-%d") + "T00:00:00"
+        clauses = ["created_at >= ?"]
+        params: List[Any] = [start_prefix]
+        if rule:
+            clauses.append("rule = ?")
+            params.append(rule)
+        where = " AND ".join(clauses)
+        rows = self._conn.execute(
+            "SELECT substr(created_at, 1, 10) AS day, "
+            "SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent, "
+            "SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed "
+            "FROM alert_events WHERE %s GROUP BY day" % where,
+            params,
+        ).fetchall()
+        counts: Dict[str, tuple] = {}
+        for r in rows:
+            counts[r["day"]] = (
+                int(r["sent"] or 0),
+                int(r["failed"] or 0),
+            )
+        out: List[Dict[str, Any]] = []
+        total = 0
+        for offset in range(days):
+            day = (start_date + timedelta(days=offset)).strftime("%Y-%m-%d")
+            sent, failed = counts.get(day, (0, 0))
+            total += sent + failed
+            out.append({"date": day, "sent": sent, "failed": failed})
+        return {"days": out, "total": total}
 
     def prune_alert_events(self, days: int = 30, max_rows: int = 5000) -> int:
         """Delete events older than ``days`` and cap the table at ``max_rows``.

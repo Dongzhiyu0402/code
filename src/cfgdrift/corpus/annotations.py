@@ -25,6 +25,8 @@ The :class:`KappaCalculator` implements Cohen's kappa / weighted kappa
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
@@ -47,6 +49,8 @@ __all__ = [
     "Annotation",
     "AnnotationStore",
     "KappaCalculator",
+    "render_kappa_markdown",
+    "render_kappa_csv",
 ]
 
 
@@ -480,3 +484,79 @@ class KappaCalculator:
                 ),
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# kappa export renderers (v0.10.0, P0-4)
+# ---------------------------------------------------------------------------
+
+
+def render_kappa_markdown(
+    result: dict, annotator_a: str, annotator_b: str
+) -> str:
+    """Render a kappa result as a Markdown appendix (v0.10.0, P0-4).
+
+    Produces a summary table (``对比对 | kappa | 加权 kappa (linear) |
+    加权 kappa (quadratic) | n``) followed by the confusion matrix table
+    (rows = annotator A, columns = annotator B), directly usable as a paper
+    appendix.
+    """
+    out: List[str] = ["# Cohen's kappa 一致性标注结果", ""]
+    out.append(
+        "| 对比对 | kappa | 加权 kappa (linear) | 加权 kappa (quadratic) | n |"
+    )
+    out.append("|---|---|---|---|---|")
+    out.append(
+        "| %s vs %s | %.3f | %.3f | %.3f | %d |"
+        % (
+            annotator_a,
+            annotator_b,
+            float(result["kappa"]),
+            float(result["weighted"]["linear"]),
+            float(result["weighted"]["quadratic"]),
+            int(result["n"]),
+        )
+    )
+    out.append("")
+    cm = result["confusion_matrix"]
+    cats = list(cm.keys())
+    out.append(
+        "## 混淆矩阵（行 = %s，列 = %s）" % (annotator_a, annotator_b)
+    )
+    out.append("")
+    out.append("| %s \\ %s | %s |" % (annotator_a, annotator_b, " | ".join(cats)))
+    out.append("|" + "---|" * (len(cats) + 1))
+    for ca in cats:
+        cells = ["%d" % int(cm[ca][cb]) for cb in cats]
+        out.append("| %s | %s |" % (ca, " | ".join(cells)))
+    out.append("")
+    return "\n".join(out)
+
+
+def render_kappa_csv(
+    rows: List[dict], annotator_a: str, annotator_b: str
+) -> str:
+    """Render per-instance kappa comparison rows as CSV (v0.10.0, P0-4).
+
+    ``rows`` is a list of ``{"instance_id", "label_a", "label_b", "agree"}``
+    dicts.  Returns a UTF-8 BOM-prefixed CSV string with ``\\r\\n`` line
+    endings (Excel / WPS friendly), mirroring :mod:`cfgdrift.core.csvreport`.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(
+        ["instance_id", annotator_a, annotator_b, "一致", "类别A", "类别B"]
+    )
+    for row in rows:
+        agree = "是" if bool(row.get("agree")) else "否"
+        writer.writerow(
+            [
+                row.get("instance_id", ""),
+                annotator_a,
+                annotator_b,
+                agree,
+                row.get("label_a", ""),
+                row.get("label_b", ""),
+            ]
+        )
+    return "\ufeff" + buf.getvalue()

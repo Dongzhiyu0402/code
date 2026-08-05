@@ -21,6 +21,7 @@ from .alert.dispatcher import AlertDispatcher
 from .alert.models import AlertRule
 from .alert.state import AlertStateStore
 from .core.compare import CompareEngine
+from .core.comparediff import diff_reports
 from .core.constraints import ConstraintEngine, violations_from_items
 from .core.differ import SemanticDiffer
 from .core.masker import SensitiveMasker, masking_config_path
@@ -32,6 +33,8 @@ from .corpus.annotations import (
     DEFAULT_CATEGORIES,
     AnnotationStore,
     KappaCalculator,
+    render_kappa_csv,
+    render_kappa_markdown,
 )
 from .corpus.config import CorpusConfig
 from .corpus.exporter import CorpusExporter
@@ -209,7 +212,7 @@ def _render_explain_text(
     else:
         mode = "模板模式，未配置 LLM key"
     click.echo("")
-    click.echo("%s（cfgdrift v0.9.0 · %s）" % (title, mode))
+    click.echo("%s（cfgdrift v%s · %s）" % (title, __version__, mode))
     click.echo("=" * 64)
     for i, narrative in enumerate(narratives, start=1):
         click.echo(
@@ -829,6 +832,9 @@ def compare(ctx: click.Context, environments: tuple, severity_filter: Optional[s
 @cli.command()
 @click.option("--scan-id", "scan_id", type=int, default=None,
               help="Scan id to render (default: latest scan).")
+@click.option("--diff", "diff_ids", nargs=2, type=int, default=None,
+              metavar="SCAN_A SCAN_B",
+              help="Compare the drift items of two scans (v0.10.0, P0-3).")
 @click.option("--json", "json_path", type=click.Path(), default=None,
               help="Write the JSON report to a file.")
 @click.option("--html", "html_path", type=click.Path(), default=None,
@@ -838,10 +844,24 @@ def compare(ctx: click.Context, environments: tuple, severity_filter: Optional[s
 @click.option("--color/--no-color", default=True, help="Colored terminal output.")
 @click.option("--no-line", "no_line", is_flag=True, help="Hide line numbers in output.")
 @click.pass_context
-def report(ctx: click.Context, scan_id: Optional[int], json_path: Optional[str],
-           html_path: Optional[str], csv_path: Optional[str],
-           color: bool, no_line: bool) -> int:
-    """Render a stored scan report (terminal, JSON, CSV or standalone HTML)."""
+def report(ctx: click.Context, scan_id: Optional[int], diff_ids: Optional[tuple],
+           json_path: Optional[str], html_path: Optional[str],
+           csv_path: Optional[str], color: bool, no_line: bool) -> int:
+    """Render a stored scan report (terminal, JSON, CSV or standalone HTML).
+
+    With ``--diff SCAN_A SCAN_B`` (v0.10.0) the two scans' drift items are
+    compared instead: ``--diff`` is mutually exclusive with ``--scan-id`` /
+    ``--html`` / ``--csv``, and optional ``--json PATH`` writes the masked
+    diff document.  Exit codes follow the drift convention: 0 = no
+    difference, 1 = difference, 2 = error.
+    """
+    if diff_ids is not None:
+        if scan_id is not None or html_path or csv_path:
+            raise ValueError(
+                "--diff is mutually exclusive with --scan-id, --html and --csv"
+            )
+        return _report_diff(ctx, int(diff_ids[0]), int(diff_ids[1]),
+                            json_path=json_path)
     formats = [p for p in (json_path, html_path, csv_path) if p]
     if len(formats) > 1:
         raise ValueError("--json, --html and --csv are mutually exclusive")
@@ -939,6 +959,116 @@ def _item_from_dict(d: Dict[str, Any]):
         masked=bool(d.get("masked", False)),
         constraint_violations=list(d.get("constraint_violations", []) or []),
     )
+
+
+def _fmt_json_value(value: Any) -> str:
+    """Render a drift value for the terminal (JSON, None -> null)."""
+    if value is None:
+        return "null"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _diff_item_location(item: Dict[str, Any]) -> str:
+    """``file:line`` (or plain ``file``) for one diff side."""
+    location = str(item.get("file", ""))
+    if item.get("line") is not None:
+        location = "%s:%d" % (location, int(item["line"]))
+    return location
+
+
+def _diff_item_line(item: Dict[str, Any]) -> str:
+    """Render one added/removed item: ``[SEV] key (file:line): old -> new``."""
+    sev = str(item.get("severity", "NONE"))
+    where = str(item.get("key_path") or "(file)")
+    return "  [%s] %s (%s): %s -> %s" % (
+        sev,
+        where,
+        _diff_item_location(item),
+        _fmt_json_value(item.get("old_value")),
+        _fmt_json_value(item.get("new_value")),
+    )
+
+
+def _diff_changed_line(entry: Dict[str, Any]) -> str:
+    """Render one changed entry with the A/B side details (v0.10.0, P0-3)."""
+    item_a = entry.get("item_a") or {}
+    item_b = entry.get("item_b") or {}
+    sev_a = str(item_a.get("severity", "NONE"))
+    sev_b = str(item_b.get("severity", "NONE"))
+    where = str(item_a.get("key_path") or item_b.get("key_path") or "(file)")
+    location = _diff_item_location(item_b) or _diff_item_location(item_a)
+    return "  [%s→%s] %s (%s): %s -> %s | %s -> %s" % (
+        sev_a,
+        sev_b,
+        where,
+        location,
+        _fmt_json_value(item_a.get("old_value")),
+        _fmt_json_value(item_a.get("new_value")),
+        _fmt_json_value(item_b.get("old_value")),
+        _fmt_json_value(item_b.get("new_value")),
+    )
+
+
+def _report_diff(
+    ctx: click.Context,
+    scan_a: int,
+    scan_b: int,
+    json_path: Optional[str] = None,
+) -> int:
+    """Compare two stored scans' drift items (v0.10.0, P0-3).
+
+    Data flow (D6): ``store.get_scan`` -> ``mask_payload`` (both payloads) ->
+    :func:`diff_reports`.  Sensitive values are masked at the display exit,
+    matching every other report renderer.
+    """
+    store = _open_store(ctx)
+    try:
+        payload_a = store.get_scan(scan_a)
+        payload_b = store.get_scan(scan_b)
+    except ValueError as exc:
+        store.close()
+        raise ValueError(str(exc)) from exc
+    store.close()
+    if payload_a.get("code") != 0 or payload_b.get("code") != 0:
+        raise ValueError("scan report is invalid")
+
+    masker = _build_masker()
+    masker.mask_payload(payload_a)
+    masker.mask_payload(payload_b)
+    items_a = (payload_a.get("data") or {}).get("items", []) or []
+    items_b = (payload_b.get("data") or {}).get("items", []) or []
+    diff = diff_reports(
+        items_a, items_b, base_scan_id=scan_a, target_scan_id=scan_b
+    )
+
+    if json_path:
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(diff, fh, ensure_ascii=False, indent=2)
+        click.echo("report diff written to %s" % json_path)
+        return 1 if diff["summary"]["total"] > 0 else 0
+
+    summary = diff["summary"]
+    click.echo(
+        "report diff #%d -> #%d: added=%d removed=%d changed=%d"
+        % (scan_a, scan_b, summary["added"], summary["removed"],
+           summary["changed"])
+    )
+    if summary["total"] == 0:
+        click.echo("两次扫描无差异")
+        return 0
+    if summary["added"]:
+        click.echo("新增（A 有 B 无，%d 项）" % summary["added"])
+        for item in diff["added"]:
+            click.echo(_diff_item_line(item))
+    if summary["removed"]:
+        click.echo("消失（B 有 A 无，%d 项）" % summary["removed"])
+        for item in diff["removed"]:
+            click.echo(_diff_item_line(item))
+    if summary["changed"]:
+        click.echo("变化（严重度/值变，%d 项）" % summary["changed"])
+        for entry in diff["changed"]:
+            click.echo(_diff_changed_line(entry))
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1840,10 +1970,16 @@ def corpus_annotate(workspace_dir: str, annotator: str, skip_annotated: bool,
               help="Weighted kappa variant to display (default: none).")
 @click.option("--json", "json_output", is_flag=True,
               help="Output JSON.")
+@click.option("--export", "export_path", default=None, type=click.Path(),
+              help="Write the kappa result to PATH (.md = paper appendix "
+                   "markdown, .csv = per-instance rows with UTF-8 BOM; "
+                   "v0.10.0, P0-4).")
 def corpus_kappa(workspace_dir: str, annotator_a: Optional[str],
                  annotator_b: Optional[str], weighted: str,
-                 json_output: bool) -> int:
+                 json_output: bool, export_path: Optional[str]) -> int:
     """Compute Cohen's kappa between two annotators (C-C5, Q2)."""
+    if export_path and json_output:
+        raise ValueError("--export and --json are mutually exclusive")
     ws = CorpusWorkspace(workspace_dir)
     instances = _load_corpus_instances(ws)
     known_ids = {str(inst.get("instance_id", "")) for inst in instances}
@@ -1915,6 +2051,33 @@ def corpus_kappa(workspace_dir: str, annotator_a: Optional[str],
             % (a, b, len(common))
         )
     result = KappaCalculator.cohen_kappa(seq_a, seq_b, DEFAULT_CATEGORIES)
+
+    if export_path:
+        # v0.10.0 (P0-4): --export PATH picks the renderer by extension.
+        ext = os.path.splitext(export_path)[1].lower()
+        if ext == ".md":
+            text = render_kappa_markdown(result, a, b)
+        elif ext == ".csv":
+            rows = [
+                {
+                    "instance_id": iid,
+                    "label_a": by_instance[iid][a],
+                    "label_b": by_instance[iid][b],
+                    "agree": by_instance[iid][a] == by_instance[iid][b],
+                }
+                for iid in common
+            ]
+            text = render_kappa_csv(rows, a, b)
+        else:
+            raise ValueError(
+                "--export requires a .md or .csv path (got %r)" % export_path
+            )
+        # newline='': the CSV string already carries \r\n and the BOM; the
+        # text-mode newline translation would otherwise double the \r.
+        with open(export_path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        click.echo("kappa results written to %s" % export_path)
+        return 0
 
     if json_output:
         payload = {
@@ -2549,6 +2712,37 @@ def alert_disable(ctx: click.Context, name: str) -> int:
     path = AlertConfig.default_path(_daemon_home())
     AlertConfig.set_enabled(path, name, False)
     click.echo("alert rule %r disabled" % name)
+    return 0
+
+
+@alert.command("mute")
+@click.argument("name")
+@click.option("--until", required=True,
+              help="ISO-8601 UTC timestamp until which the rule is muted "
+                   "(e.g. 2026-08-06T09:00:00Z; a trailing Z is accepted).")
+@click.pass_context
+def alert_mute(ctx: click.Context, name: str, until: str) -> int:
+    """Mute a rule until the given ISO-8601 UTC timestamp (v0.10.0).
+
+    Interoperates with the Web UI: both go through ``AlertConfig.set_mute``
+    (alerts.yaml).  The daemon picks the change up on its next scan cycle.
+    """
+    path = AlertConfig.default_path(_daemon_home())
+    AlertConfig.set_mute(path, name, until)
+    rules = AlertConfig.load(path)
+    rule = next((r for r in rules if r.name == name), None)
+    click.echo("alert rule %r muted until %s" % (name, rule.mute_until))
+    return 0
+
+
+@alert.command("unmute")
+@click.argument("name")
+@click.pass_context
+def alert_unmute(ctx: click.Context, name: str) -> int:
+    """Remove a rule's mute window (v0.10.0; interoperable with Web)."""
+    path = AlertConfig.default_path(_daemon_home())
+    AlertConfig.clear_mute(path, name)
+    click.echo("alert rule %r unmuted" % name)
     return 0
 
 

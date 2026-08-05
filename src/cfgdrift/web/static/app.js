@@ -104,6 +104,11 @@ async function renderOverview() {
   $("#view-overview").innerHTML =
     '<h2>概览</h2>' +
     daemonCard +
+    // v0.10.0 (P0-1): zero-noise — the muted-rules card renders only when
+    // at least one rule is currently muted.
+    (data.muted_rules > 0
+      ? '<div class="card"><p>当前静默规则 ' + data.muted_rules + " 条</p></div>"
+      : "") +
     '<div class="card">' +
     "<p class=\"muted\">共 " + data.scan_count + " 次扫描 · " + data.baseline_count + " 个基线</p>" +
     "<p>最近扫描 #" + (latest ? latest.scan_id : "-") +
@@ -274,10 +279,14 @@ function renderSvgPie(dist) {
 // v0.9.0 (P0-1/P0-4): one-shot jump target for the timeline row click, and
 // the CSV export entry point.
 let reportPreselect = null;
+// v0.10.0 (P0-3): scan list cache so the compare panel reuses the timeline
+// options without a second fetch.
+let reportScans = [];
 
 async function renderReports() {
   const data = await api("/api/overview");
   const scans = data.timeline || [];
+  reportScans = scans;
   const options = scans.map((s) =>
     '<option value="' + s.scan_id + '">#' + s.scan_id + " " + fmtTime(s.created_at) + " (" + (s.baseline ? s.baseline.name : "no baseline") + ")</option>"
   ).join("");
@@ -298,17 +307,88 @@ async function renderReports() {
     '<button class="action" id="reportLoad">加载</button>' +
     '<button class="action" id="reportExport">导出 HTML</button>' +
     '<button class="action" id="reportExportCsv">导出 CSV</button>' +
+    // v0.10.0 (P0-3): report-to-report diff entry (two-scan compare panel).
+    '<button class="action" id="reportCompare">对比</button>' +
     "</div>" +
-    '<div class="card" id="reportBody"></div>';
+    '<div class="card" id="reportBody"></div>' +
+    '<div id="reportComparePanel"></div>';
   if (scans.length || reportPreselect !== null) {
     if (selectId !== null) $("#reportScan").value = selectId;
     $("#reportLoad").addEventListener("click", loadReport);
     $("#reportExport").addEventListener("click", exportReportHtml);
     $("#reportExportCsv").addEventListener("click", exportReportCsv);
+    $("#reportCompare").addEventListener("click", openReportCompare);
     loadReport();
   }
   // One-shot: clear so re-entering the view never re-jumps.
   reportPreselect = null;
+}
+
+// v0.10.0 (P0-3): the compare panel reuses the timeline's scan options and
+// calls the same diff function as `cfgdrift report --diff`.
+function openReportCompare() {
+  const panel = $("#reportComparePanel");
+  const options = (reportScans || []).map((s) =>
+    '<option value="' + s.scan_id + '">#' + s.scan_id + " " + fmtTime(s.created_at) + "</option>"
+  ).join("");
+  panel.innerHTML =
+    '<div class="card form-row">' +
+    '<label>扫描 A：<select id="cmpScanA">' + options + "</select></label>" +
+    '<label>扫描 B：<select id="cmpScanB">' + options + "</select></label>" +
+    '<button class="action" id="cmpRun">对比</button>' +
+    "</div>" +
+    '<div class="card" id="cmpDiffBody"><p class="muted">选择两个扫描后点击「对比」。</p></div>';
+  if ((reportScans || []).length >= 2) {
+    $("#cmpScanB").selectedIndex = 1;
+  }
+  $("#cmpRun").addEventListener("click", runReportCompare);
+}
+
+async function runReportCompare() {
+  const base = $("#cmpScanA").value;
+  const target = $("#cmpScanB").value;
+  const body = $("#cmpDiffBody");
+  body.innerHTML = '<p class="muted">对比中…</p>';
+  try {
+    const data = await api("/api/reports/compare?base_id=" + encodeURIComponent(base) +
+      "&target_id=" + encodeURIComponent(target));
+    body.innerHTML = renderDiffResult(data);
+  } catch (e) {
+    body.innerHTML = '<p style="color:var(--critical)">对比失败：' + esc(e.message) + "</p>";
+  }
+}
+
+function renderDiffResult(diff) {
+  const s = diff.summary || {};
+  if (!s.total) return '<p class="muted">两次扫描无差异</p>';
+  const group = (title, items) => {
+    if (!items || !items.length) return "";
+    return '<div style="margin-bottom:10px"><strong>' + title + "</strong>" +
+      items.map((it) => {
+        const sev = it.severity || "NONE";
+        const where = it.key_path || "(file)";
+        const loc = it.line != null && it.file ? esc(it.file) + ":" + it.line : esc(it.file || "-");
+        return '<div class="cv">[<span class="badge ' + sevClass(sev) + '">' + esc(sev) + "</span>] " +
+          esc(where) + " " + esc(JSON.stringify(it.new_value)) + " (" + loc + ")</div>";
+      }).join("") + "</div>";
+  };
+  let html = group("新增（A 有 B 无，" + s.added + " 项）", diff.added);
+  html += group("消失（B 有 A 无，" + s.removed + " 项）", diff.removed);
+  if (diff.changed && diff.changed.length) {
+    html += '<div style="margin-bottom:10px"><strong>变化（严重度/值变，' + s.changed + " 项）</strong>" +
+      diff.changed.map((c) => {
+        const a = c.item_a || {};
+        const b = c.item_b || {};
+        const sevA = a.severity || "NONE";
+        const sevB = b.severity || "NONE";
+        const where = a.key_path || b.key_path || "(file)";
+        return '<div class="cv">[<span class="badge ' + sevClass(sevA) + '">' + esc(sevA) +
+          "</span>→<span class=\"badge " + sevClass(sevB) + '">' + esc(sevB) + "</span>] " +
+          esc(where) + " " + esc(JSON.stringify(a.new_value)) + " → " +
+          esc(JSON.stringify(b.new_value)) + "</div>";
+      }).join("") + "</div>";
+  }
+  return html;
 }
 
 async function exportReportCsv() {
@@ -565,6 +645,53 @@ function renderCompareResult(data, sev) {
 let alertPage = 0;
 const ALERT_PAGE_SIZE = 50;
 
+// v0.10.0 (P0-1): mute helpers — 1h/24h buttons build an ISO timestamp via
+// Date.toISOString() (trailing "Z" is tolerated by parse_iso_utc on the
+// backend), and the muted badge shows the local deadline + remaining hours.
+function isoPlusHours(hours) {
+  return new Date(Date.now() + hours * 3600 * 1000).toISOString();
+}
+
+function fmtMuteUntil(until) {
+  const d = new Date(until);
+  if (isNaN(d.getTime())) return until;
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const remH = Math.max(0, Math.ceil((d.getTime() - Date.now()) / 3600000));
+  return mm + "-" + dd + " " + hh + ":" + mi + " · 剩余 " + remH + "h";
+}
+
+function isRuleMuted(r) {
+  return r.mute_until && new Date(r.mute_until).getTime() > Date.now();
+}
+
+function muteCell(r) {
+  if (isRuleMuted(r)) {
+    return '<span class="muted-badge" title="' + esc(r.mute_until) + '">静默中 · 至 ' +
+      fmtMuteUntil(r.mute_until) + "</span> " +
+      '<button class="danger" data-alert-unmute="' + esc(r.name) + '">取消</button>';
+  }
+  return '<button class="action" data-alert-mute="' + esc(r.name) + '" data-hours="1">静默1h</button> ' +
+    '<button class="action" data-alert-mute="' + esc(r.name) + '" data-hours="24">静默24h</button>';
+}
+
+// v0.10.0 (P0-2): fetch + embed the SVG trend into #trendSvg (same store
+// aggregation as the events table, so chart and list can never disagree).
+async function loadTrend(rule) {
+  const params = new URLSearchParams({ days: 14 });
+  if (rule) params.set("rule", rule);
+  const data = await api("/api/alert-trend?" + params.toString());
+  const svgEl = $("#trendSvg");
+  if (svgEl) svgEl.innerHTML = data.svg;
+  const totalEl = $("#trendTotal");
+  if (totalEl) {
+    totalEl.textContent = "近 14 天共 " + data.total + " 条" +
+      (rule ? "（规则 " + rule + "）" : "");
+  }
+}
+
 async function renderAlerts() {
   const [alertsData, eventsData] = await Promise.all([
     api("/api/alerts"),
@@ -576,19 +703,34 @@ async function renderAlerts() {
 
   const ruleTable =
     '<div class="card"><h3 style="margin-bottom:10px">告警规则（alerts.yaml）</h3>' +
-    '<table><thead><tr><th>名称</th><th>类型</th><th>阈值</th><th>基线</th><th>状态</th><th>操作</th></tr></thead><tbody>' +
+    '<table><thead><tr><th>名称</th><th>类型</th><th>阈值</th><th>基线</th><th>状态</th><th>静默</th><th>操作</th></tr></thead><tbody>' +
     (alerts.length ? alerts.map((r) =>
       "<tr><td><strong>" + esc(r.name) + "</strong></td><td>" + esc(r.type) + "</td><td>" +
       '<span class="badge ' + sevClass(r.severity) + '">' + esc(r.severity) + "</span></td><td>" +
       esc(r.baseline || "all") + "</td><td>" + (r.enabled ? "启用" : "停用") +
+      "</td><td>" + muteCell(r) +
       "</td><td>" +
       '<button class="action" data-alert-toggle="' + esc(r.name) + '" data-enable="' + (r.enabled ? "false" : "true") + '">' +
       (r.enabled ? "停用" : "启用") + "</button> " +
       '<button class="action" data-alert-test="' + esc(r.name) + '">测试发送</button>' +
       '<span class="alert-feedback"></span>' +
       "</td></tr>"
-    ).join("") : '<tr><td colspan="6" class="muted">暂无告警规则（使用 <code>cfgdrift alert add</code> 添加）</td></tr>') +
+    ).join("") : '<tr><td colspan="7" class="muted">暂无告警规则（使用 <code>cfgdrift alert add</code> 添加）</td></tr>') +
     "</tbody></table></div>";
+
+  // v0.10.0 (P0-2): trend card above the events table (rule dropdown mirrors
+  // the alerts list; empty data renders the SVG empty-state, never an error).
+  const trendCard =
+    '<div class="card" id="trendCard">' +
+    '<h3 style="margin-bottom:10px">近 14 天告警趋势</h3>' +
+    '<div class="form-row">' +
+    '<label>规则：<select id="trendRule"><option value="">全部规则</option>' +
+    alerts.map((r) => '<option value="' + esc(r.name) + '">' + esc(r.name) + "</option>").join("") +
+    "</select></label>" +
+    '<span class="muted" id="trendTotal"></span>' +
+    "</div>" +
+    '<div id="trendSvg"></div>' +
+    "</div>";
 
   const eventTable =
     '<div class="card"><h3 style="margin-bottom:10px">告警事件（最近 ' + ALERT_PAGE_SIZE + " 条 / 共 " + total + " 条）</h3>" +
@@ -608,14 +750,19 @@ async function renderAlerts() {
       const retryBadge = Number(ev.retried) === 1 ? ' <span class="badge b-warn">重试</span>' : "";
       const retryBtn = ev.status === "failed"
         ? '<button class="danger" data-retry="' + ev.id + '">重试</button>'
-        : "-";
+        : "";
+      // v0.10.0 (P0-1): event-level ack — display-only, persists via
+      // POST /api/alert-events/{id}/ack; acked rows show ✓已确认.
+      const ackCell = Number(ev.acked) === 1
+        ? '<span class="badge b-info">✓已确认</span>'
+        : '<button class="action" data-ack="' + ev.id + '">ack</button>';
       return (
         "<tr><td>#" + ev.id + "</td><td>" + esc(ev.rule) + "</td><td>" + esc(ev.baseline) + "</td><td>" +
         '<span class="badge ' + sevClass(ev.severity) + '">' + esc(ev.severity) + "</span></td><td>" +
         statusBadge + retryBadge +
         "</td><td>" + esc(ev.target || "-") + "</td><td>" + ev.attempts + "</td><td>" + fmtTime(ev.created_at) + "</td><td>" +
         (ev.error ? '<span class="event-error">' + esc(ev.error) + "</span>" : "-") +
-        "</td><td>" + retryBtn + "</td></tr>"
+        "</td><td>" + ackCell + " " + retryBtn + "</td></tr>"
       );
     }).join("") : '<tr><td colspan="10" class="muted">暂无告警事件</td></tr>') +
     "</tbody></table>" +
@@ -625,7 +772,13 @@ async function renderAlerts() {
     '<button id="alertNext" ' + ((alertPage + 1) * ALERT_PAGE_SIZE >= total ? "disabled" : "") + ">下一页</button>" +
     "</div></div>";
 
-  $("#view-alerts").innerHTML = "<h2>告警管理</h2>" + ruleTable + eventTable;
+  $("#view-alerts").innerHTML = "<h2>告警管理</h2>" + ruleTable + trendCard + eventTable;
+
+  // v0.10.0 (P0-2): trend rule dropdown -> reload the SVG (all rules default).
+  $("#trendRule").addEventListener("change", () => {
+    loadTrend($("#trendRule").value).catch(() => { /* keep dashboard alive */ });
+  });
+  loadTrend("").catch(() => { /* keep dashboard alive */ });
 
   $("#alertFilterApply").addEventListener("click", () => {
     currentAlertFilter.rule = $("#alertFilterRule").value.trim();
@@ -680,6 +833,46 @@ async function renderAlerts() {
         renderAlerts();
       } catch (e) {
         alert("重试失败：" + e.message);
+      }
+    });
+  });
+  // v0.10.0 (P0-1): mute 1h/24h (PUT) and unmute (DELETE) — alerts.yaml is
+  // written through the same path as `cfgdrift alert mute/unmute`.
+  document.querySelectorAll("#view-alerts [data-alert-mute]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const until = isoPlusHours(Number(btn.dataset.hours));
+      try {
+        await api("/api/alerts/" + encodeURIComponent(btn.dataset.alertMute) + "/mute", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ until }),
+        });
+        renderAlerts();
+      } catch (e) {
+        alert("静默失败：" + e.message);
+      }
+    });
+  });
+  document.querySelectorAll("#view-alerts [data-alert-unmute]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await api("/api/alerts/" + encodeURIComponent(btn.dataset.alertUnmute) + "/mute", {
+          method: "DELETE",
+        });
+        renderAlerts();
+      } catch (e) {
+        alert("取消失败：" + e.message);
+      }
+    });
+  });
+  // v0.10.0 (P0-1): event-level ack (POST) — display-only, persisted.
+  document.querySelectorAll("#view-alerts [data-ack]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await api("/api/alert-events/" + btn.dataset.ack + "/ack", { method: "POST" });
+        renderAlerts();
+      } catch (e) {
+        alert("ack 失败：" + e.message);
       }
     });
   });

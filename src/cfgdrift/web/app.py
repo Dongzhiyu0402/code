@@ -23,7 +23,6 @@ from .. import __version__
 from ..alert.config import AlertConfig
 from ..core.masker import SensitiveMasker, masking_config_path
 from ..rules.ignore import make_rule
-
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 
@@ -102,6 +101,17 @@ def create_app(store, home: Optional[str] = None):
         except Exception:  # noqa: BLE001 - daemon status is best-effort
             daemon_status = {"running": False, "pid": None, "error": "unavailable"}
 
+        # v0.10.0 (P0-1): current number of muted rules (alerts.yaml is
+        # best-effort — a missing/corrupt file counts as 0).
+        muted_rules = 0
+        try:
+            alerts_path = os.path.join(home, "alerts.yaml")
+            for rule in AlertConfig.list_rules(alerts_path):
+                if rule.is_muted():
+                    muted_rules += 1
+        except ValueError:
+            muted_rules = 0
+
         return ok(
             {
                 "latest_scan": latest,
@@ -111,6 +121,7 @@ def create_app(store, home: Optional[str] = None):
                 "baseline_count": len(baselines),
                 "scan_count": len(scans),
                 "daemon_status": daemon_status,
+                "muted_rules": muted_rules,
             }
         )
 
@@ -144,6 +155,32 @@ def create_app(store, home: Optional[str] = None):
         except ValueError as exc:
             return err(str(exc))
         return ok(result)
+
+    @app.get("/api/reports/compare")
+    def api_reports_compare(base_id: int, target_id: int):
+        """Compare two scans' drift items (v0.10.0, P0-3).
+
+        Same pipeline as ``report --diff`` (mask -> diff_reports), so the Web
+        grouping is byte-identical to the CLI.  Returns the diff document
+        with added/removed/changed groups + summary.
+        """
+        from ..core.comparediff import diff_reports
+
+        try:
+            payload_a = store.get_scan(base_id)
+            payload_b = store.get_scan(target_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if payload_a.get("code") != 0 or payload_b.get("code") != 0:
+            return err("scan report is invalid")
+        masker.mask_payload(payload_a)
+        masker.mask_payload(payload_b)
+        items_a = (payload_a.get("data") or {}).get("items", []) or []
+        items_b = (payload_b.get("data") or {}).get("items", []) or []
+        diff = diff_reports(
+            items_a, items_b, base_scan_id=base_id, target_scan_id=target_id
+        )
+        return ok(diff)
 
     @app.get("/api/reports/{scan_id}")
     def api_report(scan_id: int):
@@ -482,6 +519,87 @@ def create_app(store, home: Optional[str] = None):
                 "status": "sent" if result.sent else "failed",
                 "sent": result.sent,
                 "error": result.error,
+            }
+        )
+
+    @app.put("/api/alerts/{name}/mute")
+    async def api_alert_mute(name: str, request: Request):
+        """Mute a rule until the given ISO-8601 timestamp (v0.10.0, P0-1).
+
+        Persists through ``AlertConfig.set_mute`` (alerts.yaml), sharing the
+        write path with the CLI ``alert mute``; the daemon picks it up on its
+        next scan cycle (D1).  Invalid ``until`` -> 400, unknown rule -> 404.
+        """
+        from ..alert.models import parse_iso_utc
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - malformed JSON body
+            return err("invalid JSON body")
+        until = body.get("until") if isinstance(body, dict) else None
+        if not isinstance(until, str) or not until.strip():
+            return err("until must be an ISO-8601 timestamp")
+        try:
+            parse_iso_utc(until)
+        except ValueError as exc:
+            return err(str(exc))
+        path = os.path.join(home, "alerts.yaml")
+        try:
+            AlertConfig.set_mute(path, name, until)
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        rules = AlertConfig.list_rules(path)
+        rule = next((r for r in rules if r.name == name), None)
+        return ok(
+            {"name": name, "mute_until": rule.mute_until if rule else None}
+        )
+
+    @app.delete("/api/alerts/{name}/mute")
+    def api_alert_unmute(name: str):
+        """Remove a rule's mute window (v0.10.0, P0-1; interoperable with CLI)."""
+        path = os.path.join(home, "alerts.yaml")
+        try:
+            AlertConfig.clear_mute(path, name)
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        return ok({"name": name, "mute_until": None})
+
+    @app.post("/api/alert-events/{event_id}/ack")
+    def api_alert_event_ack(event_id: int):
+        """Mark an alert event as acknowledged (v0.10.0, P0-1).
+
+        Display-only: ack never changes delivery / cooldown / retry behavior.
+        Returns the updated event row; unknown event -> 404.
+        """
+        try:
+            event = store.ack_alert_event(event_id)
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        return ok(event)
+
+    @app.get("/api/alert-trend")
+    def api_alert_trend(days: Optional[str] = None, rule: Optional[str] = None):
+        """Per-day sent/failed alert trend (v0.10.0, P0-2).
+
+        ``days`` is clamped to [1, 30] (default 14) and ``rule`` (empty = all
+        rules) mirrors the events-table filter.  Returns ``{svg, days, total,
+        rule}`` — ``svg`` embeds straight into the SPA, ``days``/``total``
+        let tests and the frontend verify the same source data.
+        """
+        from ..web.trend import render_trend_svg
+
+        try:
+            days_v = max(1, min(30, int(days if days is not None else 14)))
+        except (TypeError, ValueError):
+            return err("days must be an integer")
+        result = store.alert_trend(days=days_v, rule=rule or None)
+        svg = render_trend_svg(result["days"], rule or None)
+        return ok(
+            {
+                "svg": svg,
+                "days": result["days"],
+                "total": result["total"],
+                "rule": rule or "",
             }
         )
 

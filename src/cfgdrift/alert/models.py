@@ -32,6 +32,35 @@ def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_iso_utc(value: Any) -> str:
+    """Validate + normalize an ISO-8601 timestamp to UTC.
+
+    v0.10.0 (D3): ``mute_until`` / ``acked_at`` are compared as UTC ISO
+    strings in lexicographic order, so every input is validated with
+    :func:`datetime.fromisoformat` and normalized to a ``+00:00`` suffix
+    (trailing ``Z`` is tolerated for JS ``toISOString()`` compatibility;
+    naive datetimes are interpreted as UTC).  Raises ``ValueError`` for
+    non-string / malformed input.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            "invalid ISO-8601 datetime %r (expected a string)" % (value,)
+        )
+    text = value.strip()
+    if text.endswith("Z") or text.endswith("z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(
+            "invalid ISO-8601 datetime %r (expected e.g. "
+            "2026-08-06T09:00:00+00:00)" % (value,)
+        ) from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Substitution helpers
 # ---------------------------------------------------------------------------
@@ -135,6 +164,11 @@ class AlertRule:
     # v0.5.0: rule-level retry (None = use the global default).
     retry_count: Optional[int] = None  # total attempts, >= 1
     retry_delays: Optional[List[float]] = None  # inter-attempt waits, >= 0
+    # v0.10.0: optional mute window.  ``mute_until`` is an ISO-8601 UTC
+    # string; when set, the dispatcher skips the whole rule while
+    # ``now_iso < mute_until`` (lexicographic compare, D3).  Absent =
+    # never muted (old alerts.yaml files load unchanged).
+    mute_until: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.name or not isinstance(self.name, str):
@@ -148,6 +182,10 @@ class AlertRule:
             self.severity = Severity(self.severity)
         if not isinstance(self.config, dict):
             raise ValueError("alert rule config must be a mapping")
+        if self.mute_until is not None:
+            # v0.10.0 (D3): validate + normalize to a UTC ISO string so the
+            # lexicographic compare inside is_muted is always well-formed.
+            self.mute_until = parse_iso_utc(self.mute_until)
         if self.retry_count is not None:
             if isinstance(self.retry_count, bool):
                 raise ValueError(
@@ -217,6 +255,20 @@ class AlertRule:
             )
         return int(default_attempts), tuple(default_delays)
 
+    def is_muted(self, now: Optional[str] = None) -> bool:
+        """Return True when the rule is inside its mute window (v0.10.0).
+
+        ``mute_until is None`` -> never muted.  Otherwise ``now_iso <
+        mute_until`` (ISO-8601 UTC lexicographic compare, D3); at the
+        exact boundary (``now == mute_until``) the rule is **not** muted.
+        ``now`` defaults to :func:`utcnow_iso` and is normalized like
+        ``mute_until`` so aware/naive mixing can never raise.
+        """
+        if self.mute_until is None:
+            return False
+        now_iso = utcnow_iso() if now is None else parse_iso_utc(now)
+        return now_iso < self.mute_until
+
     def to_dict(self) -> dict:
         out = {
             "name": self.name,
@@ -232,6 +284,8 @@ class AlertRule:
             out["retry_count"] = self.retry_count
         if self.retry_delays is not None:
             out["retry_delays"] = list(self.retry_delays)
+        if self.mute_until is not None:
+            out["mute_until"] = self.mute_until
         return out
 
     @classmethod
@@ -278,6 +332,13 @@ class AlertRule:
                 "alert rule %r retry_delays must be a list of non-negative "
                 "numbers" % name
             )
+        # v0.10.0: optional mute_until; absent key -> None so old alerts.yaml
+        # (version 1) loads unchanged.  __post_init__ validates the value.
+        mute_until = data.get("mute_until")
+        if mute_until is not None and not isinstance(mute_until, str):
+            raise ValueError(
+                "alert rule %r mute_until must be an ISO-8601 string" % name
+            )
         return cls(
             name=name,
             type=rule_type,
@@ -287,6 +348,7 @@ class AlertRule:
             config=config,
             retry_count=retry_count,
             retry_delays=retry_delays,
+            mute_until=mute_until,
         )
 
 

@@ -35,6 +35,7 @@
 - **corpus 基准语料（v0.7.0）**：`cfgdrift corpus init|fetch|export|validate` 从真实项目 git 历史挖掘配置变更对，标准化为 `instances.jsonl` 语料（metadata + before/after 语义树 + diff + feature + labels 预留），与 diff / 约束引擎打通；支持 `local_path` 本地 git 仓库离线采集与增量拉取
 - **约束自动挖掘（v0.7.0）**：`cfgdrift constraint mine` 从历史扫描 / 语料挖掘候选（值域 enum/range、共现 conditional_required、互斥 mutual_exclusion），输出 `<home>/mined_candidates.yaml`（`enabled: false`、`status: pending`，**不自动生效**），人工确认后 `constraint add --rule` 转正
 - **Web 约束视图（v0.7.0）**：Web 仪表盘新增「约束」视图（生效约束列表 + 用户规则启用/禁用切换 + 最近约束违反分页），违反事件持久化到 C-10 `constraint_violations` 表（默认保留 90 天，`CFGDRIFT_CV_RETENTION_DAYS` 可配）
+- **告警静默 / 趋势 / 报告对比 / kappa 导出（v0.10.0）**：规则级 `mute_until` 静默 + 事件级 ack（Web 与 CLI 互操作）；近 14 天告警趋势纯 SVG 图（同源聚合）；`report --diff A B` 新增/消失/变化三组对比（CLI 与 Web 共用同一 diff 函数）；`corpus kappa --export` 一键导出论文附录 Markdown / UTF-8 BOM CSV
 - **自定义解析器插件**：`--format <plugin>` 支持第三方解析格式（见下文「自定义解析器插件」）
 
 退出码：`0`=无漂移，`1`=检出漂移，`2`=错误。
@@ -471,6 +472,38 @@ cfgdrift compare dev prod --json                    # constraint_violations 进 
 cfgdrift explain ./config --baseline prod [--format text|json] [--schema schema.yaml] [--no-llm]
 cfgdrift diff ./config --baseline prod --explain       # diff 末尾追加同一叙事区块
 ```
+
+---
+
+## v0.10.0 增量：告警静默 / 告警趋势图 / 报告对比 / corpus kappa 导出
+
+### 1. 告警静默与事件确认（P0-1）
+
+- **规则级静默（`mute_until`）**：`alerts.yaml` 规则可选新增 `mute_until`（ISO-8601 UTC，缺省不静默）；窗口内 daemon 周期触发该规则**不投递、不写事件、不写 cooldown**，到期靠时间比较自动恢复（无定时任务）。Web 规则行与 CLI 共用一条写路径，互操作：
+  - `cfgdrift alert mute NAME --until 2026-08-06T09:00:00Z` / `cfgdrift alert unmute NAME`（非法 until / 未知规则 exit 2）
+  - Web：`PUT /api/alerts/{name}/mute`（body `{"until": "ISO"}`，无效 until 400 / 未知规则 404）、`DELETE /api/alerts/{name}/mute`
+- **daemon 每周期重载 `alerts.yaml`**：运行中 Web/CLI 写入的静默 / 增删规则下一扫描周期生效；文件损坏时记日志并保留上一周期规则
+- **事件级 ack（仅展示语义）**：`alert_events` 表幂等新增 `acked` / `acked_at` 列；Web 事件行 `[ack]` 按钮 → `POST /api/alert-events/{id}/ack`，ack 后显示「✓已确认」，重复 ack 保留首次时间
+- **`alert test` / 事件重试绕过静默**（显式人工操作不受 mute 约束）
+- 概览卡片显示「当前静默规则 N 条」（无静默时不渲染）
+
+### 2. 告警历史趋势图（P0-2）
+
+- 告警视图事件表上方新增**近 14 天趋势图**（纯 SVG 字符串，零第三方依赖，`web/trend.py::render_trend_svg`），按天 × sent/failed 双序列堆叠柱，日期连续（无事件补 0），全零显示「暂无告警事件」空态
+- `GET /api/alert-trend?days=14&rule=`（`days` 钳制 `[1,30]`，`rule` 空 = 全部）→ `{"svg", "days", "total", "rule"}`；数据与事件表同源（同一 `Store.alert_trend` 聚合）
+- 前端规则下拉切换「全部规则 / 单规则」，图与事件表过滤一致
+
+### 3. 报告对比（P0-3）
+
+- `cfgdrift report --diff SCAN_A SCAN_B`：按漂移项指纹 `(file, key_path)` 分三组——**新增**（A 有 B 无）/ **消失**（B 有 A 无）/ **变化**（双方有但严重度或新值或变更类型不同，含 `severity_changed` / `value_changed` 明细）；全同输出「两次扫描无差异」
+- 退出码：有差异 `1` / 无差异 `0` / 扫描缺失或参数冲突 `2`；`--diff` 与 `--scan-id` / `--html` / `--csv` 互斥，`--json PATH` 可写脱敏后的 diff 文档
+- Web：报告视图「对比」按钮 → 选择两个扫描 → `GET /api/reports/compare?base_id=&target_id=`，三组卡片与 CLI 分组完全一致
+- diff 使用与 `report` 同一脱敏口径（`SensitiveMasker.mask_payload`），共享纯函数 `core/comparediff.py::diff_reports`
+
+### 4. corpus kappa 导出（P0-4）
+
+- `cfgdrift corpus kappa --export PATH`：按扩展名判定——`.md` 生成论文附录 Markdown（汇总表 `对比对 | kappa | 加权 kappa (linear) | 加权 kappa (quadratic) | n` + 混淆矩阵表）；`.csv` 生成逐 instance 对比行（`instance_id | annotator_a | annotator_b | 一致 | 类别A | 类别B`，UTF-8 BOM + `\r\n`，Excel / WPS 可直接打开）
+- 与 `--json` 互斥；标注不足（<2 名标注人或公共实例 <2）exit 2；未给 `--export` 时终端输出逐字节不变，kappa 计算逻辑不变
 
 ---
 

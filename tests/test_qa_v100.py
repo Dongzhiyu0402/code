@@ -410,7 +410,7 @@ class TestPartialSuccessQa:
 
 class TestRegressionQa:
     def test_version_070(self):
-        assert cfgdrift.__version__ == "0.9.0"
+        assert cfgdrift.__version__ == "0.10.0"
 
     def test_corpus_init_creates_layout(self, tmp_path, capsys):
         ws_dir = str(tmp_path / "ws")

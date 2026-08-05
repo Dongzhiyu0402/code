@@ -13,7 +13,7 @@ from typing import List
 
 import yaml
 
-from .models import AlertRule
+from .models import AlertRule, parse_iso_utc
 
 logger = logging.getLogger("cfgdrift.alert.config")
 
@@ -153,6 +153,43 @@ class AlertConfig:
         for rule in rules:
             if rule.name == name:
                 rule.enabled = bool(enabled)
+                found = True
+                break
+        if not found:
+            raise ValueError("alert rule %r not found" % name)
+        AlertConfig.save(path, rules)
+
+    @staticmethod
+    def set_mute(path: str, name: str, until: str) -> None:
+        """Mute a rule until the given ISO-8601 UTC timestamp (v0.10.0).
+
+        Mirrors ``set_enabled``'s load -> mutate -> save write path so the
+        Web PUT endpoint and the CLI ``alert mute`` share one code path.
+        ``until`` is validated + normalized by :func:`AlertRule.__post_init__`
+        (raises ``ValueError`` for malformed timestamps); unknown rules raise
+        ``ValueError`` as well.
+        """
+        rules = AlertConfig.load(path)
+        found = False
+        for rule in rules:
+            if rule.name == name:
+                # Validate + normalize before persisting (raises ValueError
+                # for malformed timestamps, D3).
+                rule.mute_until = parse_iso_utc(until)
+                found = True
+                break
+        if not found:
+            raise ValueError("alert rule %r not found" % name)
+        AlertConfig.save(path, rules)
+
+    @staticmethod
+    def clear_mute(path: str, name: str) -> None:
+        """Remove a rule's mute window (v0.10.0); unknown rule -> ValueError."""
+        rules = AlertConfig.load(path)
+        found = False
+        for rule in rules:
+            if rule.name == name:
+                rule.mute_until = None
                 found = True
                 break
         if not found:

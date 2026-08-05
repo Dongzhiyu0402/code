@@ -97,6 +97,16 @@ class AlertDispatcher:
         """Dispatch a drift report to every matching, non-cooled rule."""
         results: List[DispatchResult] = []
         for rule in self.rules:
+            # v0.10.0 (D2): mute check runs first, before enabled/baseline/
+            # severity filtering and cooldown — a muted rule is skipped
+            # entirely (no delivery, no event, no cooldown write).
+            if rule.is_muted():
+                logger.info(
+                    "alert %s muted until %s; skipped",
+                    rule.name,
+                    rule.mute_until,
+                )
+                continue
             if not self._rule_matches(rule, baseline_name, report):
                 continue
             fingerprint = drift_fingerprint(
