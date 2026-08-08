@@ -165,22 +165,22 @@ def _fetch_via_extractor(ws, cfg, fixture):
 class TestVersionContract:
     def test_module_version_070(self):
         import cfgdrift
-        assert cfgdrift.__version__ == "0.10.0"
+        assert cfgdrift.__version__ == "0.11.0"
 
     def test_pyproject_version_070(self):
         with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as fh:
-            assert 'version = "0.10.0"' in fh.read()
+            assert 'version = "0.11.0"' in fh.read()
 
     def test_csrc_version_marker(self):
         c_path = os.path.join(ROOT, "src", "csrc", "parser_core.c")
         if os.path.exists(c_path):
             with open(c_path, encoding="utf-8") as fh:
-                assert '0.10.0-c' in fh.read()
+                assert '0.11.0-c' in fh.read()
 
     def test_cli_version(self, tmp_path):
         r = _run_cli(tmp_path / "home", ["--version"])
         assert r.returncode == 0
-        assert "0.10.0" in r.stdout
+        assert "0.11.0" in r.stdout
 
     def test_new_cli_surfaces(self, tmp_path):
         r = _run_cli(tmp_path / "home", ["corpus", "--help"])

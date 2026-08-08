@@ -100,6 +100,14 @@ async function renderOverview() {
     (ds.last_scan
       ? '<p class="muted">最近守护扫描 #' + ds.last_scan.scan_id + " · " + fmtTime(ds.last_scan.created_at) + "</p>"
       : "") +
+    // v0.11.0 (P0-1): error-rate row — rendered only while the daemon is
+    // running with cycle records (zero-noise; omitted otherwise).
+    (ds.running && ds.error_rate != null && ds.cycles_total != null
+      ? '<p>错误率 ' + (ds.error_rate * 100).toFixed(1) + "% (" + ds.cycles_failed + "/" +
+        ds.cycles_total + ')</p><p class="muted">最近 ' + ds.cycles_total +
+        " 次周期：" + (ds.cycles_total - ds.cycles_failed) + " 次成功 / " +
+        ds.cycles_failed + " 次失败</p>"
+      : "") +
     "</div>";
   $("#view-overview").innerHTML =
     '<h2>概览</h2>' +
@@ -264,7 +272,7 @@ function renderSvgPie(dist) {
     const y2 = cy + r * Math.sin((a2 * Math.PI) / 180);
     const large = frac > 0.5 ? 1 : 0;
     parts +=
-      '<path d="M' + cx + " " + cy + " L" + x1 + " " + y1 +
+      '<path data-sev="' + k + '" style="cursor:pointer" d="M' + cx + " " + cy + " L" + x1 + " " + y1 +
       ' A' + r + " " + r + " 0 " + large + " 1 " + x2 + " " + y2 + " Z\" fill=\"" +
       colors[k] + '" opacity="0.85"><title>' + k + ": " + (dist[k] || 0) + "</title></path>";
     angle = a2;
@@ -464,12 +472,99 @@ async function renderBaselines() {
   const rows = data.baselines || [];
   $("#view-baselines").innerHTML =
     "<h2>基线管理</h2>" +
-    '<div class="card"><table><thead><tr><th>名称</th><th>版本</th><th>创建时间</th><th>扫描根</th><th>格式</th><th>说明</th></tr></thead><tbody>' +
+    '<div class="card"><table><thead><tr><th>名称</th><th>版本</th><th>创建时间</th><th>扫描根</th><th>格式</th><th>说明</th><th>操作</th></tr></thead><tbody>' +
     (rows.length ? rows.map((b) =>
       "<tr><td><strong>" + esc(b.name) + "</strong></td><td>v" + b.version + "</td><td>" + fmtTime(b.created_at) +
-      "</td><td>" + esc(b.scan_root) + "</td><td>" + esc(b.format) + "</td><td>" + esc(b.description) + "</td></tr>"
-    ).join("") : '<tr><td colspan="6" class="muted">暂无基线</td></tr>') +
-    "</tbody></table></div>";
+      "</td><td>" + esc(b.scan_root) + "</td><td>" + esc(b.format) + "</td><td>" + esc(b.description) +
+      '</td><td><button class="action" data-bvname="' + esc(b.name) + '">版本对比</button></td></tr>'
+    ).join("") : '<tr><td colspan="7" class="muted">暂无基线</td></tr>') +
+    "</tbody></table></div>" +
+    '<div id="bvPanel"></div>';
+
+  // v0.11.0 (P0-2): per-baseline version-compare entry -> compare panel.
+  document.querySelectorAll("#view-baselines [data-bvname]").forEach((btn) => {
+    btn.addEventListener("click", () => openBaselineVersionPanel(btn.dataset.bvname));
+  });
+}
+
+async function openBaselineVersionPanel(name) {
+  const data = await api("/api/baselines/" + encodeURIComponent(name) + "/versions");
+  const versions = data.versions || [];
+  if (versions.length < 2) {
+    $("#bvPanel").innerHTML =
+      '<div class="card"><p class="muted">基线 ' + esc(name) + " 仅 " + versions.length +
+      " 个版本，需要至少两个版本才能对比。</p></div>";
+    return;
+  }
+  const opts = versions.map((v) =>
+    '<option value="' + v.version + '">v' + v.version + " " + fmtTime(v.created_at) + "</option>"
+  ).join("");
+  $("#bvPanel").innerHTML =
+    '<div class="card" id="bvCard">' +
+    '<h3 style="margin-bottom:10px">基线 ' + esc(name) + " 版本对比</h3>" +
+    '<div class="form-row">' +
+    '<label>版本 A：<select id="bvVa">' + opts + "</select></label>" +
+    '<label>版本 B：<select id="bvVb">' + opts + "</select></label>" +
+    '<button class="action" id="bvRun">对比</button>' +
+    "</div>" +
+    '<div id="bvBody"><p class="muted">选择两个版本后点击「对比」。</p></div>' +
+    "</div>";
+  const va = $("#bvVa");
+  const vb = $("#bvVb");
+  if (versions.length >= 2) {
+    // Default: newest (A) vs previous (B).
+    va.selectedIndex = versions.length - 1;
+    vb.selectedIndex = versions.length - 2;
+  }
+  $("#bvRun").addEventListener("click", () => runBaselineVersionCompare(name));
+}
+
+async function runBaselineVersionCompare(name) {
+  const va = $("#bvVa").value;
+  const vb = $("#bvVb").value;
+  const body = $("#bvBody");
+  body.innerHTML = '<p class="muted">对比中…</p>';
+  try {
+    const data = await api(
+      "/api/baselines/compare?name=" + encodeURIComponent(name) +
+      "&va=" + encodeURIComponent(va) + "&vb=" + encodeURIComponent(vb)
+    );
+    renderBaselineVersionResult(body, data);
+  } catch (e) {
+    body.innerHTML = '<p style="color:var(--critical)">对比失败：' + esc(e.message) + "</p>";
+  }
+}
+
+function renderBaselineVersionResult(body, data) {
+  const total = (data.summary || {}).total || 0;
+  const head =
+    '<p class="muted">' + esc(data.name) + " · v" + data.version_a + " (A, " + fmtTime(data.created_at_a) +
+    ") ↔ v" + data.version_b + " (B, " + fmtTime(data.created_at_b) + ")</p>" +
+    '<div class="stat-row">' +
+    stat("差异总数", total, "warn") +
+    stat("新增", (data.added || []).length, "info") +
+    stat("消失", (data.removed || []).length, "critical") +
+    stat("变化", (data.changed || []).length, "warn") +
+    "</div>";
+  if (total === 0) {
+    body.innerHTML = head + '<p class="muted">两版本无差异</p>';
+    return;
+  }
+  const groupCard = (label, items) => {
+    if (!items.length) return "";
+    return '<div class="card"><h3 style="margin-bottom:10px">' + label + "（" + items.length + " 项）</h3>" +
+      "<table><thead><tr><th>严重度</th><th>键路径</th><th>类型</th><th>文件 / 行号</th><th>旧值</th><th>新值</th></tr></thead>" +
+      "<tbody>" + itemRows(items) + "</tbody></table></div>";
+  };
+  body.innerHTML =
+    head +
+    // Backend compare_baseline_versions(va, vb) diffs va as old / vb as new
+    // (same compare_snapshots direction as the compare CLI): change_type
+    // "added" = present in B (vb) but not in A (va), "removed" = present in
+    // A but not in B.  Labels below follow that direction.
+    groupCard("新增（B 有 A 无）", data.added || []) +
+    groupCard("消失（A 有 B 无）", data.removed || []) +
+    groupCard("变化（严重度/值变）", data.changed || []);
 }
 
 async function renderRules() {
@@ -914,8 +1009,49 @@ let cvPage = 0;
 const CV_PAGE_SIZE = 50;
 
 async function renderConstraints() {
-  const data = await api("/api/constraints");
+  const [data, candData] = await Promise.all([
+    api("/api/constraints"),
+    api("/api/constraint-candidates"),
+  ]);
   const constraints = data.constraints || [];
+  const candidates = candData.candidates || [];
+
+  // v0.11.0 (P0-3): mined-candidate card above the constraint table —
+  // empty state with a mining guide when no candidates exist; promoted ones
+  // show a ✓已转正 badge with the promote button disabled.
+  const candRows = candidates.map((c) => {
+    const m = c.metrics || {};
+    const keys = (c.constraint && c.constraint.keys || []).join(", ") || "-";
+    const examples = c.constraint && c.constraint.allowed
+      ? (c.constraint.allowed.slice(0, 3).map((v) => JSON.stringify(v)).join(", "))
+      : (c.constraint && c.constraint.min != null && c.constraint.max != null
+          ? "[" + c.constraint.min + ", " + c.constraint.max + "]"
+          : "-");
+    const json = JSON.stringify(c.constraint);
+    const promoted = c.status === "promoted";
+    const actionCell = promoted
+      ? '<span class="badge b-info">✓已转正</span>'
+      : '<button class="action" data-promote="' + esc(c.id) + '">转正</button>';
+    return (
+      '<div class="cv">' +
+      '<span class="cv-id">' + esc(c.id) + "</span> " +
+      '<span class="badge b-info">' + esc(c.kind) + "</span> " +
+      '<span class="muted">support=' + (m.support != null ? m.support : "-") +
+      " · confidence=" + (m.confidence != null ? m.confidence : "-") + "</span>" +
+      '<div class="muted">keys: ' + esc(keys) + "</div>" +
+      '<div class="muted">示例: ' + esc(examples) + "</div>" +
+      actionCell + " " +
+      '<button class="action" data-copyrule="' + esc(c.id) + '" data-rule="' +
+      esc(json).replace(/"/g, "&quot;") + '">复制命令</button>' +
+      "</div>"
+    );
+  }).join("");
+  const candCard =
+    '<div class="card"><h3 style="margin-bottom:10px">挖掘候选（mined_candidates.yaml）</h3>' +
+    (candidates.length
+      ? candRows
+      : '<p class="muted">暂无候选 · 运行 <code>cfgdrift constraint mine</code> 生成</p>') +
+    "</div>";
 
   const table =
     '<div class="card"><h3 style="margin-bottom:10px">一致性约束（生效视角）</h3>' +
@@ -937,7 +1073,7 @@ async function renderConstraints() {
     "</tbody></table></div>";
 
   $("#view-constraints").innerHTML =
-    "<h2>约束</h2>" + table + '<div id="cvEvents"></div>';
+    "<h2>约束</h2>" + candCard + table + '<div id="cvEvents"></div>';
 
   document.querySelectorAll("#view-constraints [data-cid]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -950,6 +1086,36 @@ async function renderConstraints() {
         renderConstraints();
       } catch (e) {
         alert("切换失败：" + e.message);
+      }
+    });
+  });
+
+  // v0.11.0 (P0-3): promote a candidate (confirm dialog) then refresh so the
+  // constraint table shows the new rule and the candidate card drops it.
+  document.querySelectorAll("#view-constraints [data-promote]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!window.confirm("确认将该候选写入 constraints.yaml ？（默认停用，可在约束列表启用）")) return;
+      try {
+        await api("/api/constraint-candidates/" + encodeURIComponent(btn.dataset.promote) + "/promote", {
+          method: "POST",
+        });
+        renderConstraints();
+      } catch (e) {
+        alert("转正失败：" + e.message);
+      }
+    });
+  });
+
+  // v0.11.0 (P0-3): copy a legal `cfgdrift constraint add --rule '<json>'`
+  // command to the clipboard as a CLI-side path.
+  document.querySelectorAll("#view-constraints [data-copyrule]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const cmd = "cfgdrift constraint add --rule '" + btn.dataset.rule + "'";
+      try {
+        await navigator.clipboard.writeText(cmd);
+      } catch (e) {
+        // clipboard may be unavailable in plain http contexts; fall back.
+        window.prompt("复制以下命令：", cmd);
       }
     });
   });
@@ -1027,6 +1193,16 @@ document.querySelectorAll("nav button").forEach((btn) => {
 
 // Delegate snippet clicks (event delegation survives re-renders).
 document.addEventListener("click", (e) => {
+  // v0.11.0 (P0-4): severity-pie slice click -> jump to the timeline with a
+  // preset severity filter (same slice again cancels the filter).
+  const slice = e.target.closest("#severitySvg [data-sev]");
+  if (slice) {
+    const sev = slice.dataset.sev;
+    timelineState.severity = (timelineState.severity === sev ? "" : sev);
+    timelineState.page = 0;
+    switchView("timeline");
+    return;
+  }
   const link = e.target.closest(".line-link");
   if (link) {
     openSnippet(

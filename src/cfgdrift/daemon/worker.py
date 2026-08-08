@@ -42,6 +42,8 @@ logger = logging.getLogger("cfgdrift.daemon")
 
 _DEFAULT_INTERVAL = 300
 _SLEEP_SLICE = 1.0
+# v0.11.0 (P0-1): rolling cycle log length for the daemon health error rate.
+_MAX_CYCLE_LOG = 20
 
 
 def default_home() -> str:
@@ -217,7 +219,11 @@ class DaemonWorker:
 
         try:
             while not self._stop_requested():
-                self._cycle(store)
+                result = self._cycle(store)
+                # v0.11.0 (P0-1): record ok/fail per cycle (0=ok, -1=fail);
+                # failed cycles never produce a scan row, so the health
+                # error rate is tracked here, decoupled from the timeline.
+                self._record_cycle(ok=(result == 0))
                 self._sleep_until_next()
         finally:
             if store is not None:
@@ -360,26 +366,71 @@ class DaemonWorker:
         except OSError as exc:
             self.log.warning("failed to clear pid file %s: %s", self.pid_file, exc)
 
-    def _write_info_file(self) -> None:
+    def _persist_info(self, info: Dict[str, Any]) -> None:
+        """Atomically write the info file (temp file + os.replace, D2).
+
+        Every info update goes through this single write path so a reader
+        (`DaemonManager.read_info`) never observes a half-written JSON.
+        """
         if not self.info_file:
             return
         try:
             parent = os.path.dirname(self.info_file)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            info = {
-                "pid": os.getpid(),
-                "started_at": utcnow_iso(),
-                "interval": self.interval,
-                "targets": self.paths,
-                "baseline": self.baseline_name,
-                "store": self.store_path,
-                "log_file": self.log_file,
-            }
-            with open(self.info_file, "w", encoding="utf-8") as fh:
+            tmp = self.info_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(info, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.info_file)
         except OSError as exc:
             self.log.warning("failed to write info file %s: %s", self.info_file, exc)
+
+    def _record_cycle(self, ok: bool) -> None:
+        """Record one completed cycle in the rolling health log (v0.11.0).
+
+        Reads the current info (rebuilding the base when absent/corrupt),
+        increments ``cycles_total``, appends ``{"ts", "ok"}`` keeping at most
+        ``_MAX_CYCLE_LOG`` entries (oldest dropped), then persists atomically.
+        """
+        if not self.info_file:
+            return
+        info: Dict[str, Any] = {}
+        try:
+            with open(self.info_file, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                info = loaded
+        except (OSError, ValueError):
+            info = {}  # corrupt/missing -> rebuild from base fields below
+        info.setdefault("pid", os.getpid())
+        info.setdefault("started_at", utcnow_iso())
+        info.setdefault("interval", self.interval)
+        info.setdefault("targets", self.paths)
+        info.setdefault("baseline", self.baseline_name)
+        info.setdefault("store", self.store_path)
+        info.setdefault("log_file", self.log_file)
+        cycles = info.get("cycles")
+        if not isinstance(cycles, list):
+            cycles = []
+        info["cycles_total"] = int(info.get("cycles_total", 0)) + 1
+        cycles = list(cycles)[-(_MAX_CYCLE_LOG - 1):]
+        cycles.append({"ts": utcnow_iso(), "ok": bool(ok)})
+        info["cycles"] = cycles
+        self._persist_info(info)
+
+    def _write_info_file(self) -> None:
+        if not self.info_file:
+            return
+        info = {
+            "pid": os.getpid(),
+            "started_at": utcnow_iso(),
+            "interval": self.interval,
+            "targets": self.paths,
+            "baseline": self.baseline_name,
+            "store": self.store_path,
+            "log_file": self.log_file,
+        }
+        self._persist_info(info)
 
     def _clear_info_file(self) -> None:
         if not self.info_file:

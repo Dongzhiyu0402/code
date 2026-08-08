@@ -60,6 +60,37 @@ def create_app(store, home: Optional[str] = None):
     async def value_error_handler(request: Request, exc: ValueError):
         return err(str(exc), status=400)
 
+    def _daemon_status_payload() -> Dict[str, Any]:
+        """Assemble the daemon status payload (single path for both endpoints).
+
+        v0.11.0 (P0-1): when the daemon is running and the info file carries a
+        non-empty ``cycles`` log, derive ``error_rate`` (0~1 float, 4dp) /
+        ``cycles_total`` / ``cycles_failed``.  Zero-noise: the three keys are
+        absent otherwise, and the existing shape (running/pid/stale/info/
+        error/last_scan) never changes.
+        """
+        try:
+            from ..daemon.daemon import DaemonManager
+
+            status = DaemonManager(home).status_dict()
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            return {"running": False, "pid": None, "stale": False, "info": None,
+                    "error": str(exc)}
+        try:
+            scans = store.list_scans(1)
+            status["last_scan"] = scans[0] if scans else None
+        except Exception:  # noqa: BLE001
+            status["last_scan"] = None
+        if status.get("running"):
+            info = status.get("info") or {}
+            cycles = info.get("cycles")
+            if isinstance(cycles, list) and cycles:
+                failed = sum(1 for c in cycles if not c.get("ok", True))
+                status["error_rate"] = round(failed / len(cycles), 4)
+                status["cycles_total"] = int(info.get("cycles_total", len(cycles)))
+                status["cycles_failed"] = failed
+        return status
+
     # -- API -------------------------------------------------------------
 
     @app.get("/api/overview")
@@ -88,18 +119,9 @@ def create_app(store, home: Optional[str] = None):
             for k in totals:
                 totals[k] += int(s["summary"].get(k, 0))
 
-        daemon_status = None
-        try:
-            from ..daemon.daemon import DaemonManager
-
-            daemon_status = DaemonManager(home).status_dict()
-            if daemon_status.get("running"):
-                try:
-                    daemon_status["last_scan"] = scans[0] if scans else None
-                except Exception:  # noqa: BLE001
-                    daemon_status["last_scan"] = None
-        except Exception:  # noqa: BLE001 - daemon status is best-effort
-            daemon_status = {"running": False, "pid": None, "error": "unavailable"}
+        # v0.11.0 (P0-1): single assembly path shared with /api/daemon-status
+        # so the overview card and the status endpoint can never drift apart.
+        daemon_status = _daemon_status_payload()
 
         # v0.10.0 (P0-1): current number of muted rules (alerts.yaml is
         # best-effort — a missing/corrupt file counts as 0).
@@ -347,6 +369,104 @@ def create_app(store, home: Optional[str] = None):
     def api_baselines():
         rows = store.list_baselines()
         return ok({"baselines": [b.to_dict() for b in rows]})
+
+    @app.get("/api/baselines/{name}/versions")
+    def api_baseline_versions(name: str):
+        """List every version of one baseline (v0.11.0, P0-2).
+
+        ``name`` with no versions at all -> 404 (``code:2``); the version
+        list itself is the full history ordered v0, v1, ... (any version gaps
+        are simply absent — the frontend shows the real stored history).
+        """
+        versions = store.list_baseline_versions(name)
+        if not versions:
+            return err("baseline %r not found" % name, status=404)
+        return ok(
+            {
+                "name": name,
+                "versions": [
+                    {
+                        "version": v.version,
+                        "created_at": v.created_at,
+                        "description": v.description,
+                    }
+                    for v in versions
+                ],
+            }
+        )
+
+    @app.get("/api/baselines/compare")
+    def api_baseline_compare(
+        name: str, va: Optional[str] = None, vb: Optional[str] = None
+    ):
+        """Tree-level diff of two versions of the same baseline (P0-2).
+
+        Reuses ``CompareEngine.compare_baseline_versions`` (the same
+        ``compare_snapshots`` pure function as the ``compare`` CLI) with the
+        shared ``SensitiveMasker`` — grouped into added/removed/changed with a
+        summary; identical versions return all-empty groups.  ``va == vb`` ->
+        400; a missing version -> 404.
+        """
+        from ..core.compare import CompareEngine
+        from ..rules.severity import SeverityConfig
+        from ..rules.severity import default_path as severity_config_path
+
+        try:
+            version_a = int(va)
+            version_b = int(vb)
+        except (TypeError, ValueError):
+            return err("va and vb must be integers")
+        if version_a == version_b:
+            return err("va and vb must be different versions")
+        severity_rules = []
+        sev_path = severity_config_path(home)
+        if os.path.exists(sev_path):
+            severity_rules = SeverityConfig.load(sev_path)
+        engine = CompareEngine(store)
+        try:
+            data = engine.compare_baseline_versions(
+                name,
+                version_a,
+                version_b,
+                severity_rules=severity_rules,
+                masker=masker,
+            )
+        except ValueError as exc:
+            return err(str(exc), status=404)
+        return ok(data)
+
+    @app.get("/api/constraint-candidates")
+    def api_constraint_candidates():
+        """List mined constraint candidates (v0.11.0, P0-3).
+
+        Reads ``<home>/mined_candidates.yaml`` via :func:`load_candidates_view`
+        — missing file -> zero-noise empty state with a mining guide message;
+        corrupt file -> 400 with a readable message.
+        """
+        from ..web.candidates import load_candidates_view
+
+        try:
+            return ok(load_candidates_view(home))
+        except ValueError as exc:
+            return err(str(exc))
+
+    @app.post("/api/constraint-candidates/{candidate_id}/promote")
+    def api_constraint_candidate_promote(candidate_id: str):
+        """Promote a mined candidate into constraints.yaml (v0.11.0, P0-3).
+
+        Reuses the ``constraint add`` write path (``ConstraintConfig.add_rule``)
+        with ``enabled: false``; already-promoted candidates and already-added
+        rules are idempotent success.  Unknown candidate -> 404; a corrupt
+        mined_candidates.yaml -> 400 (consistent with ``GET``).
+        """
+        from ..web.candidates import promote_candidate
+
+        try:
+            return ok(promote_candidate(home, candidate_id))
+        except ValueError as exc:
+            message = str(exc)
+            status = 400 if "is corrupt" in message else 404
+            return err(message, status=status)
 
     @app.get("/api/rules")
     def api_rules(baseline_id: Optional[int] = None):
@@ -605,14 +725,16 @@ def create_app(store, home: Optional[str] = None):
 
     @app.get("/api/daemon-status")
     def api_daemon_status():
-        """Return daemon status + the most recent scan (no printing)."""
-        try:
-            from ..daemon.daemon import DaemonManager
+        """Return daemon status + the most recent scan (no printing).
 
-            status = DaemonManager(home).status_dict()
+        v0.11.0 (P0-1): reuses ``_daemon_status_payload`` so ``error_rate`` /
+        ``cycles_total`` / ``cycles_failed`` appear exactly when the daemon is
+        running and has cycle records (zero-noise otherwise).
+        """
+        try:
+            status = _daemon_status_payload()
         except Exception as exc:  # noqa: BLE001 - best-effort
             return err(str(exc))
-        status["last_scan"] = store.list_scans(1)[0] if store.list_scans(1) else None
         return ok(status)
 
     @app.get("/api/file-snippet")

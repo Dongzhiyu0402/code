@@ -197,3 +197,70 @@ class CompareEngine:
                 for item in rep.items:
                     masker.mask_item(item)
         return reports
+
+    # -- baseline version comparison (v0.11.0, P0-2) ---------------------
+
+    def compare_baseline_versions(
+        self,
+        name: str,
+        version_a: int,
+        version_b: int,
+        severity_rules: Optional[List[SeverityRule]] = None,
+        masker: Optional[SensitiveMasker] = None,
+        constraints: Optional[List[Any]] = None,
+    ) -> dict:
+        """Tree-level diff of two versions of the *same* baseline (D3).
+
+        Reuses :meth:`compare_snapshots` — the exact pure function behind the
+        ``compare`` CLI — so grouping/fields are byte-identical to the CLI
+        (no environment semantics).  Items are grouped by ``change_type``:
+        ``added`` / ``removed`` / ``changed`` (modified | type_changed) and
+        masked with ``SensitiveMasker.mask_item`` *before* ``to_dict`` (same
+        masking exit as ``/api/compare``).  Missing versions raise
+        ``ValueError`` (the caller maps them to 404).
+
+        Returns ``{"name", "version_a", "version_b", "created_at_a",
+        "created_at_b", "added", "removed", "changed", "summary"}`` where
+        ``summary`` = ``{"added", "removed", "changed", "total"}`` (all zero
+        when the two versions are identical).
+        """
+        bl_a = self.store.show_baseline(name, int(version_a))
+        bl_b = self.store.show_baseline(name, int(version_b))
+        items, _ = self.compare_snapshots(
+            name,
+            name,
+            bl_a.data,
+            bl_b.data,
+            severity_rules=severity_rules,
+            old_lines=bl_a.line_maps,
+            new_lines=bl_b.line_maps,
+            constraints=constraints,
+        )
+        if masker is not None:
+            for item in items:
+                masker.mask_item(item)
+        added = [item.to_dict() for item in items if item.change_type.value == "added"]
+        removed = [
+            item.to_dict() for item in items if item.change_type.value == "removed"
+        ]
+        changed = [
+            item.to_dict()
+            for item in items
+            if item.change_type.value in ("modified", "type_changed")
+        ]
+        return {
+            "name": name,
+            "version_a": int(version_a),
+            "version_b": int(version_b),
+            "created_at_a": bl_a.created_at,
+            "created_at_b": bl_b.created_at,
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+            "summary": {
+                "added": len(added),
+                "removed": len(removed),
+                "changed": len(changed),
+                "total": len(added) + len(removed) + len(changed),
+            },
+        }

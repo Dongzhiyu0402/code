@@ -202,6 +202,48 @@ class ConstraintMiner:
             yaml.safe_dump(payload, fh, allow_unicode=True, sort_keys=False)
 
     @staticmethod
+    def mark_promoted(path: str, candidate_id: str) -> None:
+        """Mark a candidate ``status: promoted`` atomically (v0.11.0, P0-3).
+
+        Loads the candidate file, flips the matching candidate to
+        ``status=promoted``, then writes the whole payload back through a
+        temp file + ``os.replace`` so a failed write never corrupts the
+        original file.  Raises ``ValueError`` when the id is unknown (or the
+        file is missing/corrupt).
+        """
+        if not os.path.exists(path):
+            raise ValueError("mined candidates file not found: %s" % path)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+        except Exception as exc:  # noqa: BLE001 - surface as a readable error
+            raise ValueError(
+                "mined candidates file %s is corrupt: %s" % (path, exc)
+            ) from exc
+        if not isinstance(data, dict):
+            raise ValueError("mined candidates config must be a mapping at %s" % path)
+        raw = data.get("candidates")
+        if not isinstance(raw, list):
+            raise ValueError(
+                "mined candidates 'candidates' must be a list at %s" % path
+            )
+        entries = [dict(e) for e in raw if isinstance(e, dict)]
+        target = next((e for e in entries if e.get("id") == candidate_id), None)
+        if target is None:
+            raise ValueError(
+                "mined candidate %r not found" % candidate_id
+            )
+        target["status"] = "promoted"
+        data["candidates"] = entries
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(data, fh, allow_unicode=True, sort_keys=False)
+        os.replace(tmp, path)
+
+    @staticmethod
     def load_candidates(path: str) -> List[MinedCandidate]:
         """Load + validate mined_candidates.yaml (empty list when absent)."""
         if not os.path.exists(path):

@@ -292,6 +292,19 @@ class Store:
             raise ValueError("baseline %r version %d not found" % (name, version))
         return self._baseline_from_row(row)
 
+    def list_baseline_versions(self, name: str) -> List[Baseline]:
+        """Return every stored version of a baseline (v0.11.0, P0-2).
+
+        Ordered by ``version ASC`` so the Web version list reads v0, v1, ...
+        (empty list when the name has no versions at all — callers decide
+        whether to surface a 404).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM baselines WHERE name = ? ORDER BY version ASC",
+            (name,),
+        ).fetchall()
+        return [self._baseline_from_row(r) for r in rows]
+
     def rollback_baseline(self, name: str) -> Baseline:
         """Delete the latest version; the previous version becomes current.
 

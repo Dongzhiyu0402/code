@@ -217,12 +217,12 @@ def make_dispatcher(rules, state_path, cfg_home, attempts=1, sleep_fn=noop_sleep
 
 class TestRegressionV020:
     def test_version_strings(self):
-        assert __version__ == "0.10.0"
+        assert __version__ == "0.11.0"
         try:
             import cfgdrift._cfgdrift as c
         except ImportError:  # pragma: no cover - pure-Python installs
             pytest.skip("C extension not available (cfgdrift._cfgdrift)")
-        assert c.version() == "0.10.0-c"
+        assert c.version() == "0.11.0-c"
 
     def test_semantic_diff_still_works(self, tmp_path):
         """A plain v0.2.0-style scan->baseline->diff->store cycle still works."""
@@ -430,7 +430,7 @@ class TestScriptChannel:
         assert len(results) == 1 and results[0].sent is True
         data = json.loads(open(recorder, encoding="utf-8").read())
         assert data["CFGDRIFT_EVENT"] == "cfgdrift.drift"
-        assert data["CFGDRIFT_VERSION"] == "0.10.0"
+        assert data["CFGDRIFT_VERSION"] == "0.11.0"
         assert data["CFGDRIFT_SEVERITY"] == "CRITICAL"
         assert data["CFGDRIFT_BASELINE"] == "prod"
         assert data["CFGDRIFT_TARGET"] == "/etc/app"
@@ -842,7 +842,7 @@ class TestEndToEndAlertChain:
 
             # -- payload field correctness (independent assertions) --
             assert payload["event"] == "cfgdrift.drift"
-            assert payload["version"] == "0.10.0"
+            assert payload["version"] == "0.11.0"
             assert payload["baseline"] == "prod"
             assert payload["target"] == os.path.abspath(project)
             assert payload["drift_count"] >= 1

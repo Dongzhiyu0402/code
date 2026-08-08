@@ -41,7 +41,7 @@ from cfgdrift.rules.ignore import make_rule  # noqa: E402
 @requires_c
 def test_c_version():
     assert isinstance(version(), str)
-    assert version().startswith("0.10.0")
+    assert version().startswith("0.11.0")
 
 
 # ---------------------------------------------------------------------------

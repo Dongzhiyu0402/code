@@ -36,6 +36,7 @@
 - **约束自动挖掘（v0.7.0）**：`cfgdrift constraint mine` 从历史扫描 / 语料挖掘候选（值域 enum/range、共现 conditional_required、互斥 mutual_exclusion），输出 `<home>/mined_candidates.yaml`（`enabled: false`、`status: pending`，**不自动生效**），人工确认后 `constraint add --rule` 转正
 - **Web 约束视图（v0.7.0）**：Web 仪表盘新增「约束」视图（生效约束列表 + 用户规则启用/禁用切换 + 最近约束违反分页），违反事件持久化到 C-10 `constraint_violations` 表（默认保留 90 天，`CFGDRIFT_CV_RETENTION_DAYS` 可配）
 - **告警静默 / 趋势 / 报告对比 / kappa 导出（v0.10.0）**：规则级 `mute_until` 静默 + 事件级 ack（Web 与 CLI 互操作）；近 14 天告警趋势纯 SVG 图（同源聚合）；`report --diff A B` 新增/消失/变化三组对比（CLI 与 Web 共用同一 diff 函数）；`corpus kappa --export` 一键导出论文附录 Markdown / UTF-8 BOM CSV
+- **daemon 健康可观测 / 基线版本对比 / 约束治理闭环 / 严重度联动（v0.11.0）**：daemon 每周期滚动记录最近 20 次 ok/fail，概览卡片与 `/api/daemon-status` 展示 `error_rate`（info 文件原子写）；基线管理视图选同一基线的两个版本树级对比（复用 `compare_snapshots`，与 `compare` CLI 同源）；约束视图「挖掘候选」卡片一键转正（复用 `constraint add` 写路径，`enabled:false` 保守停用，幂等防重复）；严重度饼图点击扇区跳转已筛选时间线
 - **自定义解析器插件**：`--format <plugin>` 支持第三方解析格式（见下文「自定义解析器插件」）
 
 退出码：`0`=无漂移，`1`=检出漂移，`2`=错误。
@@ -472,6 +473,36 @@ cfgdrift compare dev prod --json                    # constraint_violations 进 
 cfgdrift explain ./config --baseline prod [--format text|json] [--schema schema.yaml] [--no-llm]
 cfgdrift diff ./config --baseline prod --explain       # diff 末尾追加同一叙事区块
 ```
+
+---
+
+## v0.11.0 增量：daemon 健康可观测 / 基线版本对比 / 约束候选转正 / 严重度联动
+
+### 1. daemon 健康增强：错误率聚合（P0-1）
+
+- **info 文件滚动周期记录**：daemon worker 每周期在 `daemon.info.json` 追加一条 `{ts, ok}`（`ok=false` = 周期内任一目标 scan 抛异常），滚动保留最近 20 次，`cycles_total` 会话内单调递增；info 文件统一走临时文件 + `os.replace` **原子写**（读方永不读到半截 JSON）
+- **API 新字段（零噪音）**：`GET /api/daemon-status` 与 `/api/overview` 内嵌 `daemon_status` 共用同一装配路径 `_daemon_status_payload`，仅当 daemon **运行中且有周期记录**时出现 `error_rate`（0~1 浮点，round 4）/ `cycles_total` / `cycles_failed`；未运行 / 无记录时字段省略，既有字段（`running/pid/stale/info/error/last_scan`）形状不变
+- **概览卡片**：守护进程卡片新增「错误率 X% (f/N)」行 + 副行「最近 N 次周期：X 次成功 / Y 次失败」；无 `error_rate` 时整行省略
+- 失败周期**不产生 scan 行**，错误率与时间线扫描数互不干扰
+
+### 2. 基线版本对比 Web 化（P0-2）
+
+- **版本列表**：`GET /api/baselines/{name}/versions` → `{"name", "versions": [{version, created_at, description}]}`（按 version 升序）；该 name 无任何版本 → 404
+- **树级对比**：`GET /api/baselines/compare?name=&va=&vb=` 复用 `CompareEngine.compare_baseline_versions`（即 `compare` CLI 同源的 `compare_snapshots` 纯函数，无环境语义），分三组——**新增**（A 有 B 无）/ **消失**（B 有 A 无）/ **变化**（modified|type_changed），行字段 = 键路径 / 文件 / 行号 / 严重度 / 旧新值，脱敏在 `to_dict` 前 `mask_item`（与 `/api/compare` 同口径）
+- 返回 `{"name", "version_a/b", "created_at_a/b", "added", "removed", "changed", "summary"}`；`va==vb` → 400，版本缺失 → 404；全同 → 三组空 + 前端「两版本无差异」空态
+- Web：基线管理视图每行「版本对比」按钮 → 面板选择两个版本 → 三组卡片
+
+### 3. 约束挖掘候选展示 + 一键转正（P0-3）
+
+- **候选列表**：`GET /api/constraint-candidates` 读 `<home>/mined_candidates.yaml`（复用 `mining.load_candidates`）；文件缺失 → 空态 + 「运行 `cfgdrift constraint mine` 生成候选」引导（不报错）；损坏 → 400 可读
+- **一键转正**：`POST /api/constraint-candidates/{id}/promote` → `Constraint.from_dict(constraint, source="user")` → `ConstraintConfig.add_rule`（与 CLI `constraint add` 共用写路径，**原子写**）→ `mining.mark_promoted`（`status: promoted` 原子写回候选文件）
+- 转正写入 `enabled: false`（保守：不自动激活，可在约束列表启用）；幂等——候选已转正或约束已存在时直接成功返回，重复点击不报错；未知候选 → 404
+- Web：约束视图新增「挖掘候选」卡片（kind / support / confidence / keys / 示例值），每候选 `[转正]`（确认弹窗）+ `[复制命令]`（`cfgdrift constraint add --rule '<json>'` 旁路）；转正后刷新约束表可见新规则、候选标「✓已转正」且按钮禁用
+
+### 4. 严重度分布联动（P0-4，纯前端）
+
+- 严重度饼图每个扇区 `<path>` 增 `data-sev` 属性 + `cursor:pointer`；document 级事件委托（防饼图每帧重渲染丢事件）
+- 点击某严重度扇区 → 设 `timelineState.severity` 并 `switchView("timeline")`，时间线视图复用既有 `/api/scans?severity=` 筛选，筛选器自动显示当前值；再点同扇区或选「全部」取消筛选；无数据视图（无扇区）点击自然无效果
 
 ---
 

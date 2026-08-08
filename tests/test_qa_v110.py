@@ -725,15 +725,15 @@ def test_explain_diff_explain_appends_block(tmp_path):
 def test_version_contract():
     import cfgdrift
 
-    assert cfgdrift.__version__ == "0.10.0"
+    assert cfgdrift.__version__ == "0.11.0"
     # pyproject.toml
     with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as fh:
-        assert 'version = "0.10.0"' in fh.read()
+        assert 'version = "0.11.0"' in fh.read()
     # C backend version
     try:
         from cfgdrift import _cfgdrift
 
-        assert _cfgdrift.version() == "0.10.0-c"
+        assert _cfgdrift.version() == "0.11.0-c"
     except ImportError:
         pytest.skip("C backend not built in this environment")
 

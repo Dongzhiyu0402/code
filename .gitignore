@@ -124,3 +124,7 @@ _qa_v100_*.py
 _qa_v100_e2e_*/
 _pid_repro.py
 dist-v090/
+
+# v0.11.0 调试/临时产物
+_qa_v110_*.py
+dist-v0100/

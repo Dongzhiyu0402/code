@@ -859,5 +859,5 @@ class TestRegression:
         except ImportError:  # pragma: no cover - pure-Python installs
             pytest.skip("C extension not available (cfgdrift._cfgdrift)")
 
-        assert cfgdrift.__version__ == "0.10.0"
-        assert _cfgdrift.version() == "0.10.0-c"
+        assert cfgdrift.__version__ == "0.11.0"
+        assert _cfgdrift.version() == "0.11.0-c"
